@@ -35,6 +35,11 @@ local C = {
     net_heal       = true,   -- 用引擎 set_game_object_field 给坦克/FRV 车体（HUD 显示的网络血量）回血（v0.8b 实测 FRV 可行）
     hull_zones     = true,   -- 坦克/FRV：被打爆部位的 HP 数值也回满（模型不变），车体血量才会回（v0.8 推断：车体 = 上限 - 各部位损失）
     authority_only = true,   -- 只改本机有权威的组件（descriptor flags bit0）
+    shadow         = true,   -- v0.12：自动学习并同步血量的影子字段（修好的血下一次受伤就消失的问题）
+    hunt           = true,   -- v0.12c：每辆载具第一次给主血量回血时自动 hunt（扫描内存找游戏另存的血量）
+    hunt_ms        = 3,      -- v0.12g：hunt 扫描分到每帧做，每帧至少用这么多毫秒（原来一次扫完会卡 4~5 秒）
+    hunt_ms_max    = 12,     -- v0.12h：落后于进度时每帧最多用这么多毫秒
+    hunt_secs      = 15,     -- v0.12h：目标扫描时长（秒）。按进度自动调每帧用时，一般 15~20 秒扫完
     test           = false,  -- 测试模式：忽略护盾，所有载具都回复
     shield         = { ['ed13ddc480ec6910'] = true }, -- 护盾生成器本体（v0.10 修正：73f8498bffdcf415 是通用空降仓，每个战略配备/增援都会生成）
     weapon         = {},     -- 额外允许补弹的武器实体资源 hash
@@ -64,8 +69,8 @@ local ARM_WEAPON = {  -- 这些实体自身可能带弹匣组件
 -- 弹药总量（helldivers.wiki.gg，2026-09 查询）。total = 弹匣/已装填 + 备弹，load = 弹匣容量（已知时）
 -- 手臂与载具的对应关系来自 HUD zones.lua / mount_policy.lua；坦克武器 goid 规则来自 DRIVER HUD
 local AMMO_SPEC = {
-    -- EXO-55 Breakthrough：左臂护盾（无弹药），右臂破片炮 弹匣 6 + 备弹 60（游戏内实测）
-    ['df51fe8d62f294be'] = { total = 66, load = 6, name = 'EXO-55 flak cannon' },
+    -- EXO-55 Breakthrough：左臂护盾（无弹药），右臂破片炮 弹匣 6 + 备弹 64 = 70（v0.12g：按用户实测总量 70 含弹匣）
+    ['df51fe8d62f294be'] = { total = 70, load = 6, name = 'EXO-55 flak cannon' },
     -- EXO-45 Patriot：左火箭 14，右转管机枪 1350
     ['824b7e0c4c879eb5'] = { total = 14, name = 'EXO-45 rockets' },
     ['08f6089289c83d22'] = { total = 1350, name = 'EXO-45 minigun' },
@@ -143,7 +148,7 @@ local function read_settings()
             f:write('# Shield Vehicle Resupply 设置。改完在 shield_resupply_cmd.txt 写 reload\n',
                 '# shield=<16位hex> 可写多行；weapon=<hex> 同理；ammo_max=<hex>:<字段>=<数值>\n',
                 'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=0\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
-                'ammo_rate=0.10\ncooldown=2\nauthority_only=1\n')
+                'ammo_rate=0.10\ncooldown=2\nauthority_only=1\nshadow=1\nhunt=1\n')
             f:close()
         end
         return
@@ -228,6 +233,39 @@ do
         local function s(v) return v >= 2147483648 and v - 4294967296 or v end
         return W.i32(p, s(old), s(new))
     end
+    -- float 字段（v0.12 影子字段）：旧值按原始 4 字节比对，所以不受浮点误差影响
+    function W.f32(p, oldraw, new)
+        if not ok then return false end
+        local nb = ffi.new('float[1]', new)
+        local ns = ffi.string(nb, 4)
+        if ns == oldraw then return false end
+        if N.win.read(p, 4) ~= oldraw or not W.writable(p) then W.fails = W.fails + 1; return false end
+        got[0] = 0
+        local r = k.WriteProcessMemory(k.GetCurrentProcess(), ffi.cast('void *', p), nb, 4, got)
+        local good = r ~= 0 and tonumber(got[0]) == 4 and N.win.read(p, 4) == ns
+        if good then W.writes = W.writes + 1 else W.fails = W.fails + 1 end
+        return good
+    end
+    -- hunt 诊断用：进程里所有已提交、PAGE_READWRITE、MEM_PRIVATE 的内存区
+    function W.rw_regions()
+        local out, at = {}, 65536
+        if not ok then return out end
+        for _ = 1, 1000000 do
+            if at >= 140737488355328 then break end
+            if tonumber(k.VirtualQuery(ffi.cast('const void *', at), ffi.cast('void *', mbi), 48)) ~= 48 then break end
+            local b = ffi.string(mbi, 48)
+            local start, size, state, prot, typ = ptr(b, 0), ptr(b, 24), u32(b, 32), u32(b, 36), u32(b, 40)
+            if size == 0 or start + size <= at then break end
+            if state == 0x1000 and prot == 4 and typ == 0x20000 then out[#out + 1] = { start, size } end
+            at = start + size
+        end
+        return out
+    end
+    function W.rpm(p, buf, n)
+        if not ok then return false end
+        got[0] = 0
+        return k.ReadProcessMemory(k.GetCurrentProcess(), ffi.cast('const void *', p), buf, n, got) ~= 0 and tonumber(got[0]) == n
+    end
 end
 
 local TEST_HOOK = rawget(_G, '__SVR_TEST')  -- 仅离线测试用
@@ -248,6 +286,7 @@ local function reset_context()
     S.vehicles, S.weapons, S.shields, S.seen_ent, S.spotted = {}, {}, {}, nil, {}
     S.last_total, S.last_hit, S.frac, S.ammo_max, S.reported, S.next_roster = {}, {}, {}, {}, {}, 0
     S.shield_born, S.shield_expired, S.vstate, S.want_units = {}, {}, {}, nil
+    S.hunt_n, S.scan = 0, nil
 end
 
 
@@ -687,14 +726,165 @@ local function config_address(g, net, hm, d)
 end
 
 
-local function heal(v, dt)
+-- ---------------------------------------------------------------------------
+-- 影子字段（v0.12）
+-- 现象：护盾里修好的血，下一次受伤就整段消失。说明游戏受伤时不是从 +0x14 / +0xF8 往下减，
+-- 而是用记录里另一个我们没写的值（血量镜像、累计伤害或血量比例）重新算。
+-- filediver 的 datalibrary 只有配置（HealthComponent：上限、回复速度、RegenerationSegments…），
+-- 没有 0x1B8 运行时记录的布局，所以在游戏里自动学：
+--   1. 每次写血时，记下记录里其它仍等于 旧血量 / 上限-旧血量 / 旧血量÷上限 的 i32/f32 字段（候选）
+--   2. 之后游戏把血量改低时，哪个候选同时变成了对应的新值，它就是影子字段
+--   3. 按资源 hash 存进 shield_resupply_learned.txt；以后每次写血同步写影子字段（同样写前比对、写后读回）
+-- 学不到时把受伤前后整条记录的差异写进日志（heal lost …），用来人工定位。
+-- ---------------------------------------------------------------------------
+local LEARN = DIR .. 'shield_resupply_learned.txt'
+local SHADOW = {}   -- SHADOW[资源][目标偏移] = { {o=偏移, f=是否 float, m='m' 镜像 | 'd' 伤害 | 'r' 比例}, ... }
+local MODE_NAME = { m = 'mirror', d = 'damage', r = 'ratio' }
+local function shadow_add(res, t, o, f, m)
+    SHADOW[res] = SHADOW[res] or {}
+    local list = SHADOW[res][t] or {}
+    SHADOW[res][t] = list
+    for _, s in ipairs(list) do if s.o == o then return false end end
+    list[#list + 1] = { o = o, f = f, m = m }
+    return true
+end
+local function load_shadows()
+    SHADOW = {}
+    local f = io.open(LEARN, 'r')
+    if not f then return end
+    for line in f:lines() do
+        local res, t, o, ty, m = line:match('^shadow=(%x+):(%x+):(%x+):([if]):([mdr])')
+        if res and #res == 16 then shadow_add(res:lower(), tonumber(t, 16), tonumber(o, 16), ty == 'f', m) end
+    end
+    f:close()
+end
+local function f32(s, o) return ffi.cast('const float *', s)[o / 4] end
+-- 血量字段本身（主血量、38 个部位）和损坏状态字不当候选
+local function is_slot(o) return o == 0x14 or (o >= 0x20 and o < 0x30) or (o >= 0xF8 and o < 0xF8 + 38 * 4) end
+local function near(x, y, tol) return x == x and math.abs(x - y) < tol end  -- x == x 排除 NaN
+local function shadow_value(m, max, hp) if m == 'm' then return hp elseif m == 'd' then return max - hp end return hp / max end
+local function shadow_match(s, data, max, hp)
+    local want = shadow_value(s.m, max, hp)
+    if not s.f then return i32(data, s.o) == want end
+    return near(f32(data, s.o), want, s.m == 'r' and 0.002 or 1)
+end
+local function candidates(data, A, max, known)
+    local out = {}
+    for o = 0, 0x1B4, 4 do
+        if not is_slot(o) and not known[o] then
+            local c
+            for _, m in ipairs({ 'm', 'd', 'r' }) do
+                local want = shadow_value(m, max, A)
+                if want ~= 0 and (m ~= 'r' or (want > 0.001 and want < 0.999)) then
+                    if m ~= 'r' and i32(data, o) == want then c = { o = o, f = false, m = m }; break end
+                    if near(f32(data, o), want, m == 'r' and 0.002 or 1) then c = { o = o, f = true, m = m }; break end
+                end
+            end
+            if c then
+                c.raw = data:sub(o + 1, o + 4); out[#out + 1] = c
+                if #out > 24 then return {} end  -- 太多巧合（比如血量很小），这次不学
+            end
+        end
+    end
+    return out
+end
+local function known_of(list)
+    local k = {}
+    if list then for _, s in ipairs(list) do k[s.o] = true end end
+    return k
+end
+local function dump_diff(before, after)
+    local out = {}
+    for o = 0, 0x1B4, 4 do
+        if before:sub(o + 1, o + 4) ~= after:sub(o + 1, o + 4) then
+            out[#out + 1] = string.format('+%x %d->%d (%.3g->%.3g)', o, i32(before, o), i32(after, o), f32(before, o), f32(after, o))
+        end
+    end
+    return table.concat(out, ' ')
+end
+
+-- 每次读到记录时（写血之前）核对上次写血后的候选
+local function check_pending(v, data)
+    local pend = v.pend
+    if not pend then return end
+    local res = v.d.resource
+    for t, p in pairs(pend) do
+        local now = i32(data, t)
+        if now == p.B then
+            -- 游戏没动血量，候选自己变了就不是影子
+            for i = #p.cands, 1, -1 do
+                local c = p.cands[i]
+                if data:sub(c.o + 1, c.o + 4) ~= c.raw then table.remove(p.cands, i) end
+            end
+            p.snap = data
+            if S.clock - p.t0 > 180 then pend[t] = nil end
+        else
+            pend[t] = nil
+            if now < p.B then
+                local learned = 0
+                for _, c in ipairs(p.cands) do
+                    if data:sub(c.o + 1, c.o + 4) ~= c.raw and shadow_match(c, data, p.max, now) then
+                        if shadow_add(res, t, c.o, c.f, c.m) then
+                            learned = learned + 1
+                            local fh = io.open(LEARN, 'a')
+                            if fh then fh:write(string.format('shadow=%s:%x:%x:%s:%s\n', res, t, c.o, c.f and 'f' or 'i', c.m)); fh:close() end
+                            log('shadow learned %s %s hp=+%x field=+%x %s %s (%d -> %d)', v.kind, res, t, c.o,
+                                c.f and 'f32' or 'i32', MODE_NAME[c.m], p.B, now)
+                        end
+                    end
+                end
+                -- 已学到的影子跟着变了 = 正常受伤，不是“修的血消失”
+                local followed = false
+                local list = SHADOW[res] and SHADOW[res][t]
+                if list then for _, s in ipairs(list) do if shadow_match(s, data, p.max, now) then followed = true end end end
+                if learned == 0 and not followed and now <= p.A then
+                    v.lost_logs = (v.lost_logs or 0) + 1
+                    if v.lost_logs <= 5 then
+                        log('heal lost %s %s ent=%d hp=+%x: before heal %d, healed to %d, after hit %d (max %d); changed: %s',
+                            v.kind, res, v.d.entity, t, p.A, p.B, now, p.max, dump_diff(p.snap, data))
+                    end
+                end
+            end
+        end
+    end
+end
+
+local hunt_sync, hunt_zsync  -- 见下面的 hunt
+-- 写血量字段，并同步已学到的影子字段；没学到时登记候选
+local function write_hp(v, rec, data, t, old, new, max)
+    if not W.i32(rec + t, old, new) then return false end
+    if t == 0x14 then hunt_sync(v, old, new) elseif t >= 0xF8 then hunt_zsync(v, t, old, new) end
+    if not C.shadow then return true end
+    local res = v.d.resource
+    local list = SHADOW[res] and SHADOW[res][t]
+    if list then
+        for _, s in ipairs(list) do
+            if shadow_match(s, data, max, old) then
+                local want = shadow_value(s.m, max, new)
+                if s.f then W.f32(rec + s.o, data:sub(s.o + 1, s.o + 4), want)
+                else W.i32(rec + s.o, i32(data, s.o), want) end
+            elseif not S.reported['sm' .. res .. t .. ':' .. s.o] then
+                S.reported['sm' .. res .. t .. ':' .. s.o] = true
+                log('shadow mismatch %s hp=+%x field=+%x: hp %d, field %d / %.3f (skipped)', res, t, s.o, old, i32(data, s.o), f32(data, s.o))
+            end
+        end
+    end
+    v.pend = v.pend or {}
+    local p = v.pend[t]
+    if p then p.B = new
+    else
+        v.pend[t] = { A = old, B = new, max = max, t0 = S.clock, snap = data, cands = candidates(data, old, max, known_of(list)) }
+    end
+    return true
+end
+
+local function read_record(v)
     local d = v.d
     local g = N.sample_graph()
     local net, hm = g:root('network'), g:root('health')
     g:roundtrip(net, d)
     local hi, hd = g:component(hm, d.entity, 0x1030, 0x1048)
     if hi == nil or not same(hd, d) then error('Health owner changed', 0) end
-    if C.authority_only and hd.flags % 2 ~= 1 then return 'no_authority' end
     local rec = ptr(g:watch(hm + 0x1058, 8), 0) + hi * 0x1B8
     local data = g:read(rec, 0x1B8)
     local cfg = config_address(g, net, hm, d)
@@ -719,12 +909,435 @@ local function heal(v, dt)
         v.zcache = nil; error('Health config changed', 0)
     end
     v.zcache = zc
+    g:validate()
+    return rec, data, zc, hd
+end
+
+-- ---------------------------------------------------------------------------
+-- hunt（v0.12b 诊断 + 实验修复）
+-- v0.12 实测：受伤前后 Health 记录里只有 +0x14 / 部位血量 / +0x1A4（距上次受伤的计时器）变了，
+-- 而受伤后的血量 = 修之前的血量 − 伤害（机甲 1543→修到 1800→挨一下 1444，部位 451→550→352）。
+-- 所以游戏在记录之外另存了一份血量，扣血时用它算完再盖回记录。用 Cheat Engine 式两段扫描找这份拷贝：
+--   1. hunt：对正在回血的载具，扫描进程里所有 PAGE_READWRITE 私有内存，记下等于修前血量 A 的 i32/float，
+--      以及等于 上限−A 的 i32/float（可能存的是“已受伤害”）
+--   2. 之后游戏每扣一次血，只留下跟着变成新值的地址
+--   3. 剩下 1~8 个时，回血时同步写这些地址（写前比对、写后读回、只写 PAGE_READWRITE），日志 `hunt fix`
+-- ---------------------------------------------------------------------------
+local H = nil
+local hunt_dump, zone_blocks, hunt_run
+local HUNT_CAP = 400000
+local function fbits(x)
+    local f = ffi.new('float[1]', x)
+    return ffi.cast('int32_t *', f)[0]
+end
+local HUNT_KIND = { 'i32 hp', 'i32 max-hp', 'f32 hp', 'f32 max-hp' }
+-- 第 k 种候选在血量为 hp 时应该是什么值（int32 位模式的范围）
+local function hunt_range(kind, hp, max)
+    local x = (kind == 2 or kind == 4) and max - hp or hp
+    if kind <= 2 then return x, x end
+    return fbits(math.max(0, x - 1)), fbits(x + 1)
+end
+local function hex_around(a)
+    local buf = ffi.new('uint8_t[64]')
+    if not W.rpm(a - 32, buf, 64) then return '?' end
+    local s = ffi.string(buf, 64)
+    local row = {}
+    for o = 0, 60, 4 do row[#row + 1] = string.format(o == 32 and '[%08x]' or '%08x', u32(s, o)) end
+    return table.concat(row, ' ')
+end
+local function where(a)
+    local out = {}
+    if N.base and N.image_size and a >= N.base and a < N.base + N.image_size then out[#out + 1] = string.format('module+%x', a - N.base) end
+    if H.rec and math.abs(a - H.rec) < 0x100000 then out[#out + 1] = string.format('rec%s0x%x', a < H.rec and '-' or '+', math.abs(a - H.rec)) end
+    if H.hm and math.abs(a - H.hm) < 0x1000000 then out[#out + 1] = string.format('hm%s0x%x', a < H.hm and '-' or '+', math.abs(a - H.hm)) end
+    return table.concat(out, ' ')
+end
+
+local function hunt_report(tag)
+    local n, parts = 0, {}
+    for k = 1, 4 do
+        local l = H.lists[k]
+        n = n + #l
+        parts[#parts + 1] = string.format('%s=%d%s', HUNT_KIND[k], #l, H.trunc[k] and '(满)' or '')
+    end
+    log('hunt %s: %s', tag, table.concat(parts, ' '))
+    if n > 0 and n <= 16 then
+        for k = 1, 4 do
+            for _, a in ipairs(H.lists[k]) do
+                log('  hunt %s @%x %s  %s', HUNT_KIND[k], a, where(a), hex_around(a))
+            end
+        end
+    end
+    return n
+end
+
+-- v0.12g：扫描放进协程，每帧只做一小段（update 里 scan_step 推进）。
+-- v0.12h：每帧用时按进度调：进度跟上 hunt_secs 的节奏就只用 hunt_ms，落后了最多用到 hunt_ms_max。
+-- 扫描期间载具挨了打（游戏那份拷贝变了），这次扫描作废，下次回血再来。
+local function scan_yield(done, all)
+    local sc = S.scan
+    if not (sc and sc.t0 and coroutine.running() == sc.co) then return end
+    local used = os.clock() - sc.t0
+    if used < C.hunt_ms / 1000 then return end
+    local behind = all and all > 0 and done / all < (os.clock() - sc.start) / math.max(1, C.hunt_secs)
+    if behind and used < C.hunt_ms_max / 1000 then return end
+    coroutine.yield()
+end
+
+local function region_bytes(regions)
+    local n = 0
+    for _, r in ipairs(regions) do n = n + r[2] end
+    return n
+end
+
+function hunt_run(v)
+    local p = v.pend[0x14]
+    local A, max = p.A, p.max
+    local rec, data = read_record(v)
+    local hm = ptr(N.win.read(N.base + N.roots.health, 8) or ('\0'):rep(8), 0)
+    H = { v = v, A = A, max = max, rec = rec, hm = hm, last = i32(data, 0x14), hits = 0, lists = {}, trunc = {}, scanning = true }
+    v.H = H  -- 每辆载具各自一份（v0.12f：原来全局只有一份，机甲占了，坦克/小车从没扫过）
+    H.zlast, H.zbase = {}, {}
+    local zb, nz = {}, 0
+    if v.zcache then
+        for _, z in ipairs(v.zcache.zones) do
+            local t = 0xF8 + 4 * z.i
+            H.zlast[t] = i32(data, t)
+            -- 游戏那份拷贝里是“上次受伤后/开始修之前”的值
+            H.zbase[t] = (v.pend[t] and v.pend[t].A) or i32(data, t)
+            zb[z.i] = H.zbase[t]
+            nz = math.max(nz, z.i + 1)
+        end
+    end
+    local zb0 = nz >= 2 and zb[0] or nil
+    local blocks, nb = {}, 0
+    local CH = 1048576
+    local buf = ffi.new('uint8_t[?]', CH)
+    local bufa = tonumber(ffi.cast('uintptr_t', buf))
+    local ip = ffi.cast('const int32_t *', buf)
+    local lo, hi = {}, {}
+    for k = 1, 4 do lo[k], hi[k] = hunt_range(k, A, max); H.lists[k] = {} end
+    local l1, l2, l3, l4 = H.lists[1], H.lists[2], H.lists[3], H.lists[4]
+    local n1, n2, n3, n4 = 0, 0, 0, 0
+    local a1, a2, f3a, f3b, f4a, f4b = lo[1], lo[2], lo[3], hi[3], lo[4], hi[4]
+    local total, t0 = 0, os.clock()
+    local regions = W.rw_regions()
+    local all, done = region_bytes(regions), 0
+    for _, r in ipairs(regions) do
+        local at, finish = r[1], r[1] + r[2]
+        while at < finish do
+            local n = math.min(CH, finish - at)
+            -- 跳过自己的扫描缓冲区和载具记录本身
+            if at + n > bufa and at < bufa + CH then
+            elseif W.rpm(at, buf, n) then
+                total = total + n
+                for i = 0, n / 4 - 1 do
+                    local x = ip[i]
+                    if x == zb0 and i + nz <= n / 4 then
+                        local j = 1
+                        while j < nz and ip[i + j] == zb[j] do j = j + 1 end
+                        if j == nz and nb < 64 then nb = nb + 1; blocks[nb] = at + 4 * i end
+                    end
+                    if x == a1 then
+                        if n1 < HUNT_CAP then n1 = n1 + 1; l1[n1] = at + 4 * i end
+                    elseif x == a2 then
+                        if n2 < HUNT_CAP then n2 = n2 + 1; l2[n2] = at + 4 * i end
+                    elseif x >= f3a and x <= f3b then
+                        if n3 < HUNT_CAP then n3 = n3 + 1; l3[n3] = at + 4 * i end
+                    elseif x >= f4a and x <= f4b then
+                        if n4 < HUNT_CAP then n4 = n4 + 1; l4[n4] = at + 4 * i end
+                    end
+                end
+            end
+            at = at + n
+            done = done + n
+            scan_yield(done, all)
+        end
+    end
+    H.scanning = nil
+    for k, n in ipairs({ n1, n2, n3, n4 }) do H.trunc[k] = n >= HUNT_CAP end
+    H.nz = nz
+    if nz >= 2 then zone_blocks(blocks, rec, '扫描时') end
+    for k = 1, 4 do
+        local l, out = H.lists[k], {}
+        for _, a in ipairs(l) do if a < rec or a >= rec + 0x1B8 then out[#out + 1] = a end end
+        H.lists[k] = out
+    end
+    log('hunt armed %s %s ent=%d: 修前血量 %d / 上限 %d，扫描 %.0f MB 用时 %.1f s（分 %d 帧）。现在让它挨一下打（留在护盾里）',
+        v.kind, v.d.resource, v.d.entity, A, max, total / 1048576, os.clock() - t0, S.scan and S.scan.frames or 1)
+    hunt_report('候选')
+end
+
+-- 开一个扫描任务（同一时间只跑一个）；先在这一帧跑一个时间片
+local function scan_start(fn, h)
+    S.scan = { co = coroutine.create(fn), h = h, frames = 0, start = os.clock() }
+end
+
+local function scan_step()
+    local sc = S.scan
+    if not sc then return end
+    sc.frames = sc.frames + 1
+    sc.t0 = os.clock()
+    H = sc.h
+    local ok, e = coroutine.resume(sc.co)
+    if S.scan == sc then sc.h = H end
+    if not ok then log('hunt: %s', tostring(e)); if sc.h then sc.h.scanning, sc.h.zscanning = nil, nil end end
+    if (not ok or coroutine.status(sc.co) == 'dead') and S.scan == sc then S.scan = nil end
+end
+
+local function cmd_hunt(arg, v)
+    if arg == 'off' then for _, x in pairs(S.vstate) do x.H = false end; H = nil; S.scan = nil; log('hunt off'); return end
+    if S.scan then log('hunt: 上一次扫描还没做完'); return end
+    if not v then for _, x in ipairs(S.vehicles) do if x.pend and x.pend[0x14] then v = x; break end end end
+    if not v then
+        log('hunt: 没有正在回血的载具。先让载具掉血、开进护盾里修一会（主血量涨了），再发 hunt，然后让它挨一下打')
+        return
+    end
+    scan_start(function() hunt_run(v) end, nil)
+    scan_step()
+end
+
+-- 游戏扣了血：只留下跟着变成新血量的地址
+local function hunt_filter(hp)
+    local pbuf = ffi.new('uint8_t[4096]')
+    local pip = ffi.cast('const int32_t *', pbuf)
+    for k = 1, 4 do
+        local lo, hi = hunt_range(k, hp, H.max)
+        local page, okp, out = -1, false, {}
+        for _, a in ipairs(H.lists[k]) do
+            local pg = a - a % 4096
+            if pg ~= page then page = pg; okp = W.rpm(pg, pbuf, 4096) end
+            if okp then
+                local x = pip[(a - pg) / 4]
+                if x >= lo and x <= hi then out[#out + 1] = a end
+            end
+        end
+        H.lists[k] = out
+    end
+    H.hits = H.hits + 1
+    local n = hunt_report(string.format('第 %d 次受伤后 (hp=%d)', H.hits, hp))
+    if n == 0 then
+        log('hunt %s: 没找到 i32/float 形式的拷贝（可能是量化后的网络值），hunt 结束', H.v.kind)
+        H.v.H = false; H = nil
+    elseif n <= 8 and not H.fix then
+        H.fix = true
+        log('hunt fix: 以后回血会同步写这 %d 个地址。修满后再挨一下，看血是否还会掉回去', n)
+        for k = 1, 4 do for _, a in ipairs(H.lists[k]) do hunt_dump(a) end end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- 部位血量（v0.12e）
+-- v0.12d 实测：游戏扣部位血用的拷贝和 Health 记录布局一样（部位数组也在 +0xF8），
+-- 里面存的是“上次受伤后/开始修之前”的部位血量（修过的部位在拷贝里还是旧值），一挨打就用它减伤害再盖回记录。
+-- 所以按整段找：hunt 扫描时顺便找连续 nz 个 i32 = 各部位的修前值（H.zbase）的位置（不是按单个值找，误中极少）。
+-- 之后每次有部位掉血，把掉血部位的基准值更新成新值，只留下整段仍然等于基准值的块；
+-- 过滤后剩 1~4 块时启用同步：回血写记录的部位时，块里对应位置等于基准值才改成新值（写前比对、写后读回）。
+-- 找不到时在下一次掉血时全内存再找（每局最多 3 次，每次卡 1~2 秒）。
+-- ---------------------------------------------------------------------------
+function hunt_dump(a)
+    local buf = ffi.new('uint8_t[512]')
+    if not W.rpm(a - 0x100, buf, 512) then return end
+    local s = ffi.string(buf, 512)
+    log('  hunt dump @%x %s (-0x100..+0x100):', a, where(a))
+    for r = 0, 448, 64 do
+        local row = {}
+        for o = r, r + 60, 4 do row[#row + 1] = string.format(o == 0x100 and '[%08x]' or '%08x', u32(s, o)) end
+        log('    %s%03x %s', r < 0x100 and '-' or '+', math.abs(r - 0x100), table.concat(row, ' '))
+    end
+end
+
+
+local function zone_vec()
+    local zb = {}
+    for i = 0, H.nz - 1 do zb[i] = H.zbase[0xF8 + 4 * i] end
+    return zb
+end
+
+-- 块里的部位值是否整段等于基准值
+local function block_ok(b)
+    local n = H.nz
+    local buf = ffi.new('uint8_t[?]', 4 * n)
+    if not W.rpm(b, buf, 4 * n) then return false end
+    local ip = ffi.cast('const int32_t *', buf)
+    for i = 0, n - 1 do
+        local want = H.zbase[0xF8 + 4 * i]
+        if want and ip[i] ~= want then return false end
+    end
+    return true
+end
+
+function zone_blocks(list, rec, tag)
+    local out = {}
+    for _, b in ipairs(list) do if b ~= rec + 0xF8 then out[#out + 1] = b end end
+    H.blocks, H.bfix, H.bhits = out, false, 0
+    log('hunt zone %s: %d 块部位数组 = 修前值', tag, #out)
+    for n, b in ipairs(out) do
+        if n > 8 then break end
+        log('  hunt zone block @%x %s  %s', b, where(b), hex_around(b + 0x20))
+    end
+end
+
+-- 全内存找整段部位数组
+local function block_scan(rec)
+    local zb, nz = zone_vec(), H.nz
+    for i = 0, nz - 1 do if zb[i] == nil then return {} end end
+    local zb0 = zb[0]
+    local CH = 1048576
+    local buf = ffi.new('uint8_t[?]', CH)
+    local bufa = tonumber(ffi.cast('uintptr_t', buf))
+    local ip = ffi.cast('const int32_t *', buf)
+    local blocks, t0, total = {}, os.clock(), 0
+    local regions = W.rw_regions()
+    local all, done = region_bytes(regions), 0
+    for _, r in ipairs(regions) do
+        local at, finish = r[1], r[1] + r[2]
+        while at < finish do
+            local n = math.min(CH, finish - at)
+            if at + n > bufa and at < bufa + CH then
+            elseif W.rpm(at, buf, n) then
+                total = total + n
+                for i = 0, n / 4 - nz do
+                    if ip[i] == zb0 then
+                        local j = 1
+                        while j < nz and ip[i + j] == zb[j] do j = j + 1 end
+                        if j == nz and #blocks < 64 then blocks[#blocks + 1] = at + 4 * i end
+                    end
+                end
+            end
+            at = at + n
+            done = done + n
+            scan_yield(done, all)
+        end
+    end
+    log('hunt zone scan: %.0f MB 用时 %.1f s（分 %d 帧）', total / 1048576, os.clock() - t0, S.scan and S.scan.frames or 1)
+    return blocks
+end
+
+-- 有部位掉血：更新基准值，过滤块
+local function hunt_zones(v, data, rec)
+    if not (H.nz and H.nz >= 2) then return end
+    local dropped = {}
+    for i = 0, H.nz - 1 do
+        local t = 0xF8 + 4 * i
+        local val = i32(data, t)
+        if H.zlast[t] and val < H.zlast[t] then
+            dropped[#dropped + 1] = string.format('+%x %d->%d', t, H.zlast[t], val)
+            H.zbase[t] = val
+        end
+        H.zlast[t] = val
+    end
+    if #dropped == 0 or H.zscanning then return end
+    local desc = table.concat(dropped, ' ')
+    if H.blocks and #H.blocks > 0 then
+        local out = {}
+        for _, b in ipairs(H.blocks) do if block_ok(b) then out[#out + 1] = b end end
+        H.blocks = out
+        H.bhits = H.bhits + 1
+        if #out > 0 and #out <= 4 and not H.bfix then H.bfix = true end
+        log('hunt zone 掉血 (%s)：剩 %d 块%s', desc, #out, H.bfix and '，已启用同步' or '')
+        for _, b in ipairs(out) do log('  hunt zone block @%x %s  %s', b, where(b), hex_around(b + 0x20)) end
+        if #out > 0 then return end
+    end
+    if S.scan then return end  -- 别的载具正在扫，下次掉血再说
+    H.zscans = (H.zscans or 0) + 1
+    if H.zscans > 3 then
+        if H.zscans == 4 then log('hunt zone: 全内存扫描次数用完，放弃部位同步') end
+        return
+    end
+    H.zscanning = true
+    scan_start(function()
+        local b = block_scan(rec)
+        zone_blocks(b, rec, '重新扫描 (' .. desc .. ')')
+        H.zscanning = nil
+    end, H)
+end
+
+-- 回血写部位后：同步写块里对应的位置（必须还等于基准值）
+function hunt_zsync(v, t, old, new)
+    H = v.H
+    if not (H and H.zlast) then return end
+    H.zlast[t] = new
+    if not (H.bfix and H.blocks) then return end
+    local base = H.zbase[t]
+    if not base then return end
+    local done = 0
+    for _, b in ipairs(H.blocks) do
+        if W.i32(b + (t - 0xF8), base, new) then done = done + 1 end
+    end
+    if done > 0 then
+        H.zbase[t] = new
+        if not H.blogged then H.blogged = true; log('hunt zone fix: 已同步写 %d 块 (+%x %d -> %d)', done, t, base, new) end
+    end
+end
+
+-- 每次读到 hunt 载具的记录时调用
+local function hunt_observe(v, data, rec)
+    H = v.H
+    if not H then return end
+    local hp = i32(data, 0x14)
+    if H.scanning then
+        local hit = H.last and hp < H.last
+        for t, z in pairs(H.zlast) do if i32(data, t) < z then hit = true end end
+        if hit then
+            if S.scan and S.scan.h == H then S.scan = nil end
+            v.hunt_tries = (v.hunt_tries or 0) + 1
+            if v.hunt_tries < 3 then v.H = nil else v.H = false end
+            log('hunt %s ent=%d: 扫描中挨了打，这次作废%s', v.kind, v.d.entity, v.H == nil and '，下次回血再扫' or '，不再重试')
+            H = nil
+            return
+        end
+        H.last = hp
+        return
+    end
+    if H.last and hp < H.last and hp > 0 then hunt_filter(hp) end
+    if H then H.last = hp end
+    if H and rec then hunt_zones(v, data, rec) end
+end
+
+-- 回血写 +0x14 后：同步写 hunt 找到的拷贝（当前值必须等于旧血量对应的值）
+function hunt_sync(v, old, new)
+    H = v.H
+    if not H then return end
+    H.last = new
+    if not H.fix then return end
+    local done = 0
+    for k = 1, 4 do
+        local lo, hi = hunt_range(k, old, H.max)
+        for _, a in ipairs(H.lists[k]) do
+            local raw = N.win.read(a, 4)
+            if raw and #raw == 4 then
+                local x = i32(raw, 0)
+                if x >= lo and x <= hi then
+                    local want = (k == 2 or k == 4) and H.max - new or new
+                    local okw
+                    if k <= 2 then okw = W.i32(a, x, want) else okw = W.f32(a, raw, want) end
+                    if okw then done = done + 1 end
+                end
+            end
+        end
+    end
+    if done > 0 and not H.logged then H.logged = true; log('hunt fix: 已同步写 %d 个地址 (%d -> %d)', done, old, new) end
+end
+
+-- 不在罩子里的载具：只要还有待核对的候选（或正在 hunt），就继续看它下一次受伤
+local function watch_pending(v)
+    local rec, data = read_record(v)
+    check_pending(v, data)
+    hunt_observe(v, data, rec)
+end
+
+local function heal(v, dt)
+    local d = v.d
+    local rec, data, zc, hd = read_record(v)
+    if C.authority_only and hd.flags % 2 ~= 1 then return 'no_authority' end
+    if C.shadow then check_pending(v, data) end
+    hunt_observe(v, data, rec)
     local mx = zc.mx
     local zones = {}
     for n, z in ipairs(zc.zones) do
         zones[n] = { i = z.i, hash = z.hash, max = z.max, shared = z.shared, key = z.key, hp = i32(data, 0xF8 + 4 * z.i) }
     end
-    g:validate()
 
     local hp = i32(data, 0x14)
     if hp <= 0 then return 'dead' end  -- 不复活
@@ -740,20 +1353,21 @@ local function heal(v, dt)
     local changed = 0
     if hp < mx then
         local n = amount(key .. ':h', mx, rate, dt)
-        if n > 0 and W.i32(rec + 0x14, hp, math.min(mx, hp + n)) then changed = changed + 1 end
+        if n > 0 and write_hp(v, rec, data, 0x14, hp, math.min(mx, hp + n), mx) then changed = changed + 1 end
     end
     local state = u32(data, 0x20)
     for _, z in ipairs(zones) do
         if z.max > 0 and z.hp < z.max then
             local zk = key .. z.key
+            local zo = 0xF8 + 4 * z.i
             if z.hp > 0 then
                 local n = amount(zk, z.max, rate, dt)
-                if n > 0 and W.i32(rec + 0xF8 + 4 * z.i, z.hp, math.min(z.max, z.hp + n)) then changed = changed + 1 end
+                if n > 0 and write_hp(v, rec, data, zo, z.hp, math.min(z.max, z.hp + n), z.max) then changed = changed + 1 end
             elseif z.hp > -1000000 and C.hull_zones and not C.revive and (v.kind == 'tank' or v.kind == 'frv') and not WHEEL[z.hash] then
                 -- 坦克/FRV 被打爆的部位：只把 HP 数值慢慢加回上限，不动损坏状态位（部件照样是坏的/掉的）
                 -- 游戏内实测：坦克 net 车体 6750/8000 = 8000 - (750+250+250)，正好是三个被打爆部位的损失
                 local n = amount(zk, z.max, rate, dt)
-                if n > 0 and W.i32(rec + 0xF8 + 4 * z.i, z.hp, math.min(z.max, z.hp + n)) then
+                if n > 0 and write_hp(v, rec, data, zo, z.hp, math.min(z.max, z.hp + n), z.max) then
                     changed = changed + 1
                     if not S.reported['hz' .. key .. z.i] then
                         S.reported['hz' .. key .. z.i] = true
@@ -763,7 +1377,7 @@ local function heal(v, dt)
             elseif z.hp > -1000000 and ((v.kind == 'frv' and WHEEL[z.hash] and C.tires) or (not WHEEL[z.hash] and C.revive)) then
                 -- 被打爆的部位（HP≤0）：拉回 25%，并清掉该区的 2-bit 损坏状态（2=已摧毁，游戏内实测）
                 -- 之后按正常速度继续回满。实验性：模型/脱落的部件能否恢复取决于游戏
-                if W.i32(rec + 0xF8 + 4 * z.i, z.hp, math.ceil(z.max * 0.25)) then
+                if write_hp(v, rec, data, zo, z.hp, math.ceil(z.max * 0.25), z.max) then
                     changed = changed + 1
                     if z.i < 16 then
                         local shift = 4 ^ z.i
@@ -779,6 +1393,15 @@ local function heal(v, dt)
         end
     end
     if changed > 0 then S.last_total[key] = nil end  -- 自己加的血不算“受伤”基线
+    -- 自动 hunt：每辆载具第一次回血时扫一次（v.H=false 表示扫过/放弃，不再重试）
+    -- 扫描分帧做（不卡），同一时间只扫一辆，每局最多 16 次
+    if C.hunt and v.H == nil and not S.scan and (S.hunt_n or 0) < 16 and v.pend and v.pend[0x14] then
+        v.H = false
+        S.hunt_n = (S.hunt_n or 0) + 1
+        log('hunt auto: %s ent=%d 第一次回血，自动开始 hunt（设置 hunt=0 可关）', v.kind, v.d.entity)
+        local okh, eh = pcall(cmd_hunt, nil, v)
+        if not okh then log('hunt: %s', tostring(eh)) end
+    end
     return changed
 end
 
@@ -1086,14 +1709,17 @@ local function poll_commands()
         elseif c == 'weapons' then cmd_weapons()
         elseif c == 'status' then cmd_status()
         elseif c == 'probe' then cmd_probe()
+        elseif c == 'hunt' then
+            local okh, eh = pcall(cmd_hunt, line:match('^%s*%S+%s+(%S+)'))
+            if not okh then log('hunt: %s', tostring(eh)) end
         elseif c == 'netinfo' then cmd_netinfo()
         elseif c == 'netset' then cmd_netset()
         elseif c == 'recent' then cmd_recent(tonumber(line:match('recent%s+(%d+)')) or 40)
-        elseif c == 'reload' then load_settings()
+        elseif c == 'reload' then load_settings(); load_shadows()
         elseif c == 'on' then C.enabled = true; log('enabled')
         elseif c == 'off' then C.enabled = false; log('disabled')
         elseif c == 'test' then C.test = not C.test; log('test mode = %s', tostring(C.test))
-        elseif c then log('unknown command: %s (units|recent [n]|vehicles|weapons|status|reload|on|off|test)', c) end
+        elseif c then log('unknown command: %s (units|recent [n]|vehicles|weapons|status|probe|hunt|reload|on|off|test)', c) end
     end
 end
 
@@ -1136,8 +1762,8 @@ local function tick(dt)
         if not ok then log('roster: %s', tostring(err)) end
         NETDESC.raw = nil
         if ok2 then
-            -- 护盾生成器（ed13…）实体消失 = 罩子结束（实测约 42 秒）；
-            -- shield_duration 从第一次看到它开始计时，作为兜底上限
+            -- 护盾生成器实体在罩子消失后还会留在地上，所以按 wiki 持续时间（40 秒）计时：
+            -- 从第一次看到这个实体开始算，超时就不再当作护盾
             local sh, born, now, present = {}, S.shield_born, S.clock, {}
             for _, d in ipairs(list) do
                 if C.shield[d.resource] then
@@ -1172,11 +1798,21 @@ local function tick(dt)
         end
     end
     if not C.enabled then return end
+    if S.scan then scan_step() end
     S.acc = S.acc + dt
     if S.acc < C.tick then return end
     local step = math.min(S.acc, 1); S.acc = 0
 
     stage('first service pass')
+    -- 修过血、还没等到下一次受伤、这一轮又不在罩子里的载具：继续核对影子字段候选（最多 180 秒）
+    if C.shadow or C.hunt or H then
+        for _, v in ipairs(S.vehicles) do
+            if ((v.pend and next(v.pend)) or v.H) and S.clock - (v.pend_seen or -1e9) > C.tick * 1.5 then
+                local ok = pcall(watch_pending, v)
+                if not ok then v.pend = nil end
+            end
+        end
+    end
     if #S.shields == 0 and not C.test then return end  -- 没有护盾：什么都不做（不取坐标、不读内存）
     -- 这一轮只需要这些 unit 的坐标
     local want, wn = {}, 0
@@ -1201,6 +1837,7 @@ local function tick(dt)
                     if not S.reported[k] then S.reported[k] = true; log('net heal %s %d: %s', v.kind, v.d.entity, tostring(rh)) end
                 end
             end
+            v.pend_seen = S.clock
             local ok, r = pcall(heal, v, step)
             if not ok then
                 local k = v.d.entity .. tostring(r)
@@ -1225,7 +1862,7 @@ local function tick(dt)
     S.want_units = nil
 end
 
-load_settings()
+load_settings(); load_shadows()
 if TEST_HOOK then TEST_HOOK(N, W, S, C) end
 local previous = rawget(_G, 'update')
 rawset(_G, 'update', function(dt, ...)
@@ -1238,5 +1875,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.11 (native layer from DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.12h (native layer from DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

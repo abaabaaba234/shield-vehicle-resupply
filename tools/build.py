@@ -2,11 +2,11 @@
 """拼接出单文件 addon 并打包。
 
 用法（在仓库根目录）：python tools/build.py
-输出：dist/shield_vehicle_resupply.lua、dist/ShieldVehicleResupply.zip
+输出：dist/shield_vehicle_resupply.lua、dist/ShieldVehicleResupply_<版本号>.zip
 """
 import os, subprocess, sys
 
-VERSION = 'v0.11'
+VERSION = 'v0.12h'
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src = os.path.join(root, 'src')
 dist = os.path.join(root, 'dist')
@@ -32,4 +32,4 @@ dst = os.path.join(dist, 'shield_vehicle_resupply.lua')
 open(dst, 'w', encoding='utf-8', newline='\n').write(out)
 print('wrote', dst, len(out), 'bytes')
 subprocess.check_call([sys.executable, os.path.join(root, 'tools', 'pack_patch.py'),
-                       os.path.join(dist, 'ShieldVehicleResupply.zip'), 'Shield Vehicle Resupply', dst])
+                       os.path.join(dist, 'ShieldVehicleResupply_' + VERSION + '.zip'), 'Shield Vehicle Resupply', dst])
