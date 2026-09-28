@@ -118,7 +118,24 @@ local function stage(name)
     if not stage_seen[name] then stage_seen[name] = true; log('stage: %s', name) end
 end
 
-local function load_settings()
+-- 资源 hash 索引：RES[低 32 位][高 32 位] = hex 字符串
+-- 遍历表时直接用两个 u32 查表，不再给每个实体都 string.format 一次
+local RES = {}
+local function rebuild_res()
+    RES = {}
+    for _, set in ipairs({ KIND, ARM_WEAPON, AMMO_SPEC, C.shield, C.weapon }) do
+        for h in pairs(set) do
+            local hi, lo = tonumber(h:sub(1, 8), 16), tonumber(h:sub(9, 16), 16)
+            if hi and lo then RES[lo] = RES[lo] or {}; RES[lo][hi] = h end
+        end
+    end
+end
+local function res_of(lo, hi)
+    local m = RES[lo]
+    return m and m[hi]
+end
+
+local function read_settings()
     local f = io.open(SET, 'r')
     if not f then
         f = io.open(SET, 'w')
@@ -148,6 +165,7 @@ local function load_settings()
     local n = 0; for _ in pairs(C.shield) do n = n + 1 end
     log('settings: radius=%.1f test=%s revive=%s hull_zones=%s tires=%s ammo=%s shields=%d', C.radius, tostring(C.test), tostring(C.revive), tostring(C.hull_zones), tostring(C.tires), tostring(C.ammo), n)
 end
+local function load_settings() read_settings(); rebuild_res() end
 
 -- ---------------------------------------------------------------------------
 -- 写内存：只写 PAGE_READWRITE 的已提交页；写前比对旧值，写后读回
@@ -157,9 +175,35 @@ do
     pcall(ffi.cdef, 'int __stdcall WriteProcessMemory(void *, void *, const void *, size_t, size_t *);')
     pcall(ffi.cdef, 'size_t __stdcall VirtualQuery(const void *, void *, size_t);')
     pcall(ffi.cdef, 'void * __stdcall GetCurrentProcess(void);')
+    pcall(ffi.cdef, 'int __stdcall ReadProcessMemory(void *, const void *, void *, size_t, size_t *);')
     local ok, k = pcall(ffi.load, 'kernel32')
     local mbi, got = ffi.new('uint8_t[48]'), ffi.new('size_t[1]')
     W.writes, W.fails = 0, 0
+    W.fast = ok  -- 离线测试里关掉
+    -- 大块读取（v0.11）：先用 VirtualQuery 确认整段都是已提交、可读、非 guard 页（和 N.win.read 同样的规则），
+    -- 再一次 ReadProcessMemory 读完。原来每 4 KB 一次 RPM + 字符串拼接
+    local rbuf, rcap = nil, 0
+    function W.read_big(p, n)
+        if not (W.fast and ok) or type(p) ~= 'number' or p < 65536 or n < 1 or p + n > 140737488355328 then return nil end
+        local at, finish = p, p + n
+        for _ = 1, 64 do
+            if at >= finish then break end
+            if tonumber(k.VirtualQuery(ffi.cast('const void *', at), ffi.cast('void *', mbi), 48)) ~= 48 then return nil end
+            local b = ffi.string(mbi, 48)
+            local start, extent, state, prot = ptr(b, 0), ptr(b, 24), u32(b, 32), u32(b, 36)
+            local kind = prot % 256
+            if state ~= 0x1000 or math.floor(prot / 256) % 2 == 1
+                or not (kind == 2 or kind == 4 or kind == 8 or kind == 32 or kind == 64 or kind == 128)
+                or start > at or extent == 0 or start + extent <= at then return nil end
+            at = start + extent
+        end
+        if at < finish then return nil end
+        if n > rcap then rcap = math.max(n, 65536); rbuf = ffi.new('uint8_t[?]', rcap) end
+        got[0] = 0
+        if k.ReadProcessMemory(k.GetCurrentProcess(), ffi.cast('const void *', p), rbuf, n, got) == 0
+            or tonumber(got[0]) ~= n then return nil end
+        return ffi.string(rbuf, n)
+    end
     function W.writable(p)
         if not ok then return false end
         if tonumber(k.VirtualQuery(ffi.cast('const void *', p), ffi.cast('void *', mbi), 48)) ~= 48 then return false end
@@ -260,7 +304,13 @@ local function net_heal(v, dt)
     if not (C.net_heal and S.ctx and type(GS.set_game_object_field) == 'function') then return 0 end
     if call(GS.game_object_owned, S.ctx.session, v.d.goid) ~= true then return 'not_owner' end
     if not net_hp_field_ok(v) then return 'no_field' end
-    local hp, mx = net_body(v)
+    local hp, mx
+    if v.kind == 'tank' and v.net_max then
+        hp, mx = call(GS.game_object_field, S.ctx.session, v.d.goid, HP_FIELD), v.net_max
+    else
+        hp, mx = net_body(v)
+        if v.kind == 'tank' and type(mx) == 'number' and mx > 0 then v.net_max = mx end
+    end
     if type(hp) ~= 'number' or type(mx) ~= 'number' or mx <= 0 or mx > 100000 or hp <= 0 or hp >= mx then return 0 end
     local key = v.d.entity .. ':' .. v.d.goid .. ':net'
     if v.last_net_hp and hp < v.last_net_hp then S.last_hit[key] = S.clock end
@@ -277,6 +327,8 @@ end
 -- 组件表遍历（仿 HUD arms.discover，一次性批量读）
 -- ---------------------------------------------------------------------------
 local function bulk(p, n)
+    local big = W.read_big(p, n)
+    if big then return big end
     local parts, off = {}, 0
     while off < n do
         local k = math.min(4096, n - off)
@@ -287,43 +339,108 @@ local function bulk(p, n)
     return table.concat(parts)
 end
 
--- 返回 manager 下所有 owner descriptor（filter(d) 为真才保留）
+local ammo_caps  -- 定义在补弹部分
+
+-- 字符串当 u32 数组读（使用期间字符串必须仍被局部变量引用）
+local function u32s(str) return ffi.cast('const uint32_t *', str) end
+
+-- 扫描 实体 -> 下标 哈希表，返回平行数组（不给每个条目建小表）
+local function scan_index(t, bound, what)
+    local raw = bulk(t.entries, t.capacity * 8)
+    local a, empty = u32s(raw), t.empty
+    local es, js, n, maxj = {}, {}, 0, -1
+    for i = 0, t.capacity * 2 - 2, 2 do
+        local e, j = a[i], a[i + 1]
+        if e ~= empty and j ~= 4294967295 then
+            if j >= bound then error(what, 0) end
+            n = n + 1; es[n] = e; js[n] = j
+            if j > maxj then maxj = j end
+        end
+    end
+    return es, js, n, maxj, raw
+end
+
+-- 本帧读到的网络描述符数组。组件表里的 owner 指针通常就指向这里，同一帧内直接复用，
+-- 不用再逐个 ReadProcessMemory 24 字节
+local NETDESC = { raw = nil, base = 0, len = 0, frame = -1 }
+S.desc_hit, S.desc_miss = 0, 0
+local function desc_at(p)
+    local nd = NETDESC
+    if nd.raw and nd.frame == S.frame and p >= nd.base and p + 24 <= nd.base + nd.len and (p - nd.base) % 24 == 0 then
+        S.desc_hit = S.desc_hit + 1
+        local raw = nd.raw
+        local a, o = u32s(raw), (p - nd.base) / 4
+        return a[o], a[o + 1], a[o + 2], a[o + 3], a[o + 4], a[o + 5]
+    end
+    S.desc_miss = S.desc_miss + 1
+    local b = N.win.read(p, 24)
+    if type(b) ~= 'string' or #b ~= 24 then return nil end
+    local a = u32s(b)
+    return a[0], a[1], a[2], a[3], a[4], a[5]
+end
+
+-- 返回 manager 下所有 owner descriptor（filter(已知资源 hex 或 nil, entity, unit) 为真才保留）
 local function enumerate(manager, to, dp, filter)
     local g = N.graph(N.win.read, N.base)
     local t = g:table(manager + to)
     if t.capacity == 0 then return {} end
     if t.capacity > 65536 then error('component table too large', 0) end
-    local raw = bulk(t.entries, t.capacity * 8)
-    local descs = ptr(g:watch(manager + dp, 8), 0)
-    local rows, maxj = {}, -1
-    for pos = 0, #raw - 8, 8 do
-        local e, j = u32(raw, pos), u32(raw, pos + 4)
-        if e ~= t.empty and j ~= 4294967295 then
-            if j >= 262144 then error('dense index bound', 0) end
-            rows[#rows + 1] = { e, j }; if j > maxj then maxj = j end
-        end
-    end
+    local es, js, n, maxj = scan_index(t, 262144, 'dense index bound')
     if maxj < 0 then return {} end
+    local descs = ptr(g:watch(manager + dp, 8), 0)
     local ptrs = bulk(descs, (maxj + 1) * 8)
+    local pa = u32s(ptrs)
     local out = {}
-    for _, r in ipairs(rows) do
-        local p = ptr(ptrs, r[2] * 8)
+    for i = 1, n do
+        local j = js[i]
+        local lo, hi = pa[j * 2], pa[j * 2 + 1]
+        if hi >= 32768 then error('noncanonical pointer', 0) end
+        local p = hi * 4294967296 + lo
         if p ~= 0 then
-            local b = N.win.read(p, 24)
-            if type(b) == 'string' and #b == 24 then
-                local d = { address = p, resource = hex64(b, 0), entity = u32(b, 8), unit = u32(b, 12), goid = u32(b, 16), flags = u32(b, 20) }
-                if d.entity == r[1] and filter(d) then out[#out + 1] = d end
+            local rlo, rhi, e, unit, goid, flags = desc_at(p)
+            if rlo and e == es[i] then
+                local res = res_of(rlo, rhi)
+                if filter(res, e, unit) then
+                    out[#out + 1] = { address = p, resource = res or string.format('%08x%08x', rhi, rlo),
+                        entity = e, unit = unit, goid = goid, flags = flags, j = j }
+                end
             end
         end
     end
     return out
 end
 
+-- 弹药上限“观察”：roster 时把整段组件数据一次读进来（原来是每个武器单独走一遍 refill：
+-- roundtrip + component + validate，十几次 RPM）。只更新观察到的最大值，不写内存
+local function observe_ammo(manager, comp, weapons, first)
+    local lo, hi
+    for i = first, #weapons do
+        local w = weapons[i]
+        if ((w.owner and AMMO_KIND[w.owner.kind]) or not w.owner) and not (C.authority_only and w.d.flags % 2 ~= 1) then
+            local j = w.d.j
+            if not lo or j < lo then lo = j end
+            if not hi or j > hi then hi = j end
+        end
+    end
+    if not lo then return end
+    local n = (hi - lo + 1) * comp.stride
+    if n > 262144 then error('weapon rows too spread', 0) end
+    local arr = ptr(N.win.read(manager + comp.arr, 8) or error('incomplete native read', 0), 0)
+    local rows = bulk(arr + lo * comp.stride, n)
+    for i = first, #weapons do
+        local w = weapons[i]
+        if ((w.owner and AMMO_KIND[w.owner.kind]) or not w.owner) and not (C.authority_only and w.d.flags % 2 ~= 1) then
+            local o = (w.d.j - lo) * comp.stride
+            ammo_caps(w, rows:sub(o + 1, o + comp.stride))
+        end
+    end
+end
+
 local function rebuild_roster()
     N.win.begin_sample()
     local hm = ptr(N.win.read(N.base + N.roots.health, 8) or ('\0'):rep(8), 0)
     if hm == 0 then S.vehicles, S.weapons = {}, {}; return end
-    local list = enumerate(hm, 0x1030, 0x1048, function(d) return KIND[d.resource] ~= nil end)
+    local list = enumerate(hm, 0x1030, 0x1048, function(res) return res ~= nil and KIND[res] ~= nil end)
     local vehicles, by_unit, by_entity = {}, {}, {}
     for _, d in ipairs(list) do
         local sk = d.entity .. ':' .. d.goid .. ':' .. d.resource
@@ -345,16 +462,18 @@ local function rebuild_roster()
         for _, comp in ipairs(WEAPON_COMPONENTS) do
             local m = ptr(N.win.read(N.base + comp.root, 8) or ('\0'):rep(8), 0)
             if m ~= 0 then
-                local ok, ws = pcall(enumerate, m, comp.to, comp.dp, function(d)
-                    return by_entity[d.entity] or by_unit[d.unit] or ARM_WEAPON[d.resource] or C.weapon[d.resource]
-                        or AMMO_SPEC[d.resource]
+                local ok, ws = pcall(enumerate, m, comp.to, comp.dp, function(res, e, unit)
+                    return by_entity[e] or by_unit[unit] or (res and (ARM_WEAPON[res] or C.weapon[res] or AMMO_SPEC[res]))
                 end)
                 if ok then
+                    local first = #weapons + 1
                     for _, d in ipairs(ws) do
                         local owner = by_entity[d.entity] or by_unit[d.unit] or (not KIND[d.resource] and by_goid[d.goid])
                         local spec = AMMO_SPEC[d.resource]
                         weapons[#weapons + 1] = { d = d, comp = comp, owner = owner, spec = spec }
                     end
+                    local okb, eb = pcall(observe_ammo, m, comp, weapons, first)
+                    if not okb then log('ammo observe %s: %s', comp.name, tostring(eb)) end
                 else log('weapon roster %s: %s', comp.name, tostring(ws)) end
             end
         end
@@ -366,30 +485,33 @@ end
 -- 网络实体表遍历（纯内存读取，零引擎调用）：用于找护盾和 units 差异统计
 -- 表：net+0xF1AEB0 (entity -> 下标)，描述符：net+0xF32F18 + 下标*24（HUD native.lua）
 -- ---------------------------------------------------------------------------
-local function net_descriptors(filter)
+-- all=false 时只返回已知资源（护盾/载具/武器），不给其它几千个实体建表、格式化 hash
+local function net_descriptors(all)
     N.win.begin_sample()
+    NETDESC.raw = nil
     local g = N.graph(N.win.read, N.base)
     local net = g:root('network')
     local t = g:table(net + 0xF1AEB0)
     if t.capacity == 0 then return {} end
     if t.capacity > 262144 then error('network table too large', 0) end
-    local raw = bulk(t.entries, t.capacity * 8)
-    local rows, maxj = {}, -1
-    for pos = 0, #raw - 8, 8 do
-        local e, j = u32(raw, pos), u32(raw, pos + 4)
-        if e ~= t.empty and j ~= 4294967295 then
-            if j >= 262144 then error('network dense index bound', 0) end
-            rows[#rows + 1] = { e, j }; if j > maxj then maxj = j end
-        end
-    end
+    local es, js, n, maxj = scan_index(t, 262144, 'network dense index bound')
     if maxj < 0 then return {} end
-    local descs = bulk(net + 0xF32F18, (maxj + 1) * 24)
+    local base = net + 0xF32F18
+    local descs = bulk(base, (maxj + 1) * 24)
+    NETDESC.raw, NETDESC.base, NETDESC.len, NETDESC.frame = descs, base, (maxj + 1) * 24, S.frame
+    local a = u32s(descs)
     local out = {}
-    for _, r in ipairs(rows) do
-        local o = r[2] * 24
-        local d = { address = net + 0xF32F18 + o, resource = hex64(descs, o), entity = u32(descs, o + 8),
-            unit = u32(descs, o + 12), goid = u32(descs, o + 16), flags = u32(descs, o + 20) }
-        if d.entity == r[1] and (not filter or filter(d)) then out[#out + 1] = d end
+    for i = 1, n do
+        local o = js[i] * 6
+        if a[o + 2] == es[i] then
+            local lo, hi = a[o], a[o + 1]
+            local res = res_of(lo, hi)
+            if res == nil and all then res = string.format('%08x%08x', hi, lo) end
+            if res then
+                out[#out + 1] = { address = base + o * 4, resource = res, entity = es[i],
+                    unit = a[o + 3], goid = a[o + 4], flags = a[o + 5] }
+            end
+        end
     end
     return out
 end
@@ -426,7 +548,10 @@ local function ref_index()
             if raw and raw % 4 == 1 and raw < 17179869184 then
                 local ref = (raw - 1) / 4
                 -- 只保留这一轮要查的 unit（护盾 + 载具），不给整张表建索引
-                if not want or want[ref] then map[ref] = u; n = n + 1 end
+                if not want or want[ref] then
+                    map[ref] = u; n = n + 1
+                    if want and n >= S.want_n then break end  -- 要找的都找到了
+                end
             end
         end
     end
@@ -485,7 +610,7 @@ end
 
 -- 最近生成的网络实体（entity id 最大的 N 个）
 local function cmd_recent(n)
-    local ok, list = pcall(net_descriptors, nil)
+    local ok, list = pcall(net_descriptors, true)
     if not ok then log('recent: %s', tostring(list)); return end
     table.sort(list, function(a, b) return a.entity > b.entity end)
     log('---- recent %d network entities (newest first) ----', n)
@@ -573,17 +698,31 @@ local function heal(v, dt)
     local rec = ptr(g:watch(hm + 0x1058, 8), 0) + hi * 0x1B8
     local data = g:read(rec, 0x1B8)
     local cfg = config_address(g, net, hm, d)
-    local mx = i32(g:read(cfg, 4), 0)
-    if mx <= 0 or mx > 10000000 then error('invalid max', 0) end
+    local zc = v.zcache
+    if not zc or zc.cfg ~= cfg then
+        local mx = i32(g:read(cfg, 4), 0)
+        if mx <= 0 or mx > 10000000 then error('invalid max', 0) end
+        zc = { cfg = cfg, mx = mx, zones = {} }
+        for i = 0, 37 do
+            local b = g:read(cfg + 0x208 + i * 0x228 + 0x60, 140)
+            local name = u32(b, 0)
+            if name == 0 then break end
+            local zmax = i32(b, 136)
+            -- max = -1 的部位和主血量共用上限（坦克车体 c182f110/900f8255/474c6747、机甲手臂 fd7c9885，游戏内观测）
+            if zmax == -1 then zmax = mx end
+            zc.zones[#zc.zones + 1] = { i = i, hash = string.format('%08x', name), max = zmax, shared = zmax == mx,
+                key = ':z' .. i }
+        end
+        -- 缓存下次还要核对：只 watch 主上限这 4 字节（配置换了地址也会变）
+        g:watch(cfg, 4)
+    elseif i32(g:watch(cfg, 4), 0) ~= zc.mx then
+        v.zcache = nil; error('Health config changed', 0)
+    end
+    v.zcache = zc
+    local mx = zc.mx
     local zones = {}
-    for i = 0, 37 do
-        local b = g:read(cfg + 0x208 + i * 0x228 + 0x60, 140)
-        local name = u32(b, 0)
-        if name == 0 then break end
-        local zmax = i32(b, 136)
-        -- max = -1 的部位和主血量共用上限（坦克车体 c182f110/900f8255/474c6747、机甲手臂 fd7c9885，游戏内观测）
-        if zmax == -1 then zmax = mx end
-        zones[#zones + 1] = { i = i, hash = string.format('%08x', name), max = zmax, hp = i32(data, 0xF8 + 4 * i), shared = zmax == mx }
+    for n, z in ipairs(zc.zones) do
+        zones[n] = { i = z.i, hash = z.hash, max = z.max, shared = z.shared, key = z.key, hp = i32(data, 0xF8 + 4 * z.i) }
     end
     g:validate()
 
@@ -606,7 +745,7 @@ local function heal(v, dt)
     local state = u32(data, 0x20)
     for _, z in ipairs(zones) do
         if z.max > 0 and z.hp < z.max then
-            local zk = key .. ':z' .. z.i
+            local zk = key .. z.key
             if z.hp > 0 then
                 local n = amount(zk, z.max, rate, dt)
                 if n > 0 and W.i32(rec + 0xF8 + 4 * z.i, z.hp, math.min(z.max, z.hp + n)) then changed = changed + 1 end
@@ -648,7 +787,7 @@ end
 -- ---------------------------------------------------------------------------
 -- 每个字段的上限：设置文件 > wiki 总量推算 > 观察到的最大值
 -- 观察每次检查都做（不管在不在罩子里），所以刚召唤时的满弹量会被记住
-local function ammo_caps(w, b)
+function ammo_caps(w, b)
     local d, comp, spec = w.d, w.comp, w.spec
     local obs = {}
     for _, f in ipairs(comp.fields) do
@@ -713,7 +852,7 @@ end
 -- 命令
 -- ---------------------------------------------------------------------------
 local function cmd_units()
-    local ok, list = pcall(net_descriptors, nil)
+    local ok, list = pcall(net_descriptors, true)
     if not ok then log('units: %s', tostring(list)); return end
     local cur = {}
     for _, d in ipairs(list) do cur[d.resource] = (cur[d.resource] or 0) + 1 end
@@ -991,9 +1130,11 @@ local function tick(dt)
     if S.clock >= S.next_roster then
         S.next_roster = S.clock + C.roster_every
         stage('first roster')
+        -- 先读网络表：rebuild_roster 里的 owner 描述符直接从这份缓存取
+        local ok2, list = pcall(net_descriptors, C.spot)
         local ok, err = pcall(rebuild_roster)
         if not ok then log('roster: %s', tostring(err)) end
-        local ok2, list = pcall(net_descriptors, nil)
+        NETDESC.raw = nil
         if ok2 then
             -- 护盾生成器（ed13…）实体消失 = 罩子结束（实测约 42 秒）；
             -- shield_duration 从第一次看到它开始计时，作为兜底上限
@@ -1020,12 +1161,7 @@ local function tick(dt)
                 if not ok3 then log('spot: %s', tostring(e3)) end
             else S.seen_ent = nil end
         else log('net roster: %s', tostring(list)) end
-        -- 没有护盾时，弹药上限的“观察”只在这里低频做（原来每 0.25 秒做一次）
-        if C.ammo and N.weapon_ready and #S.shields == 0 then
-            for _, w in ipairs(S.weapons) do
-                if (w.owner and AMMO_KIND[w.owner.kind]) or not w.owner then pcall(refill, w, 0, true) end
-            end
-        end
+        -- 弹药上限的“观察”已在 rebuild_roster 里批量完成（observe_ammo）
     end
     if S.watch then
         local w = S.watch
@@ -1043,11 +1179,12 @@ local function tick(dt)
     stage('first service pass')
     if #S.shields == 0 and not C.test then return end  -- 没有护盾：什么都不做（不取坐标、不读内存）
     -- 这一轮只需要这些 unit 的坐标
-    local want = {}
-    for _, d in ipairs(S.shields) do want[d.unit] = true end
-    for _, v in ipairs(S.vehicles) do want[v.d.unit] = true end
-    for _, w in ipairs(S.weapons) do if not w.owner then want[w.d.unit] = true end end
-    S.want_units = want; REF.frame = -1
+    local want, wn = {}, 0
+    local function add(u) if not want[u] then want[u] = true; wn = wn + 1 end end
+    for _, d in ipairs(S.shields) do add(d.unit) end
+    for _, v in ipairs(S.vehicles) do add(v.d.unit) end
+    for _, w in ipairs(S.weapons) do if not w.owner then add(w.d.unit) end end
+    S.want_units, S.want_n = want, wn; REF.frame = -1
     local centers = {}
     for _, d in ipairs(S.shields) do local p = position_of(d); if p then centers[#centers + 1] = p end end
     local any = #centers > 0 or C.test
@@ -1101,5 +1238,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.10b (native layer from DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.11 (native layer from DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

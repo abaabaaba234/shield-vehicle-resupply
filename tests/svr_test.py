@@ -54,7 +54,7 @@ __SVR_TEST=function(N,W,S,C)
   N.win={begin_sample=function() end, read=function(p,n) local b=pyread(p,n); if b==nil then return nil end; return b end, base=function() return 0x140000000 end}
   N.ensure=function() N.ready=true; N.base=0x140000000; N.reason='mock'; return true end
   N.check_weapon_module=function() return true end
-  C.test=(os.getenv('SVR_NOTEST')==nil); C.cooldown=0; C.exo_heal=0.5; C.tank_heal=0.5
+  W.fast=false; C.test=(os.getenv('SVR_NOTEST')==nil); C.cooldown=0; C.exo_heal=0.5; C.tank_heal=0.5
   W.i32=function(p,old,new) local ffi=require('ffi'); local ob=ffi.new('int32_t[1]',old); local nb=ffi.new('int32_t[1]',new)
     if N.win.read(p,4)~=ffi.string(ob,4) then return false end; pywrite(p,ffi.string(nb,4)); W.writes=W.writes+1; return true end
   _G.SVR={N=N,W=W,S=S,C=C}
