@@ -1,4 +1,5 @@
 dist/
+tests/.run-*/
 __pycache__/
 *.pyc
 *.log

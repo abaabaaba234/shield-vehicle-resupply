@@ -8,4 +8,9 @@
   - The license text is included verbatim in `third_party/LICENSE-DRIVER-HUD.txt`.
 - **Bingus Shared Loader v17**, by CowboyBingus. This is a required dependency and is **not** redistributed here. https://www.nexusmods.com/helldivers2/mods/16292
 - Ammo capacities come from [helldivers.wiki.gg](https://helldivers.wiki.gg/) (checked 2026-09) and from in-game measurement.
+- **filediver** by xypwn, MIT License — https://github.com/xypwn/filediver
+  - The v0.13 healing uses the game's own regeneration; the `HealthComponent` field layout (offsets of
+    `Health` / `HeathChangerate` / `HealthChangerateDisabled` / `HeathChangerateCooldown` /
+    `RegenerationSegments` / `RegenerationChangerate`, and `DamageableZoneInfo.RegenerationEnabled`) comes from
+    filediver's `datalibrary` package, which mirrors the game's plaintext data. No filediver code is redistributed here.
 - Helldivers 2 and its assets, names and identifiers belong to their respective owners. This project is not affiliated with or endorsed by Arrowhead, Sony, or the upstream authors.
