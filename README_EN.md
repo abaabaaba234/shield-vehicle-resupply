@@ -53,6 +53,9 @@ Use `parts` to list resource/zone hashes. Independently choose a part with `part
 - Without a shield, the entity roster refreshes every 3 s and continuous regeneration settings are restored. When `exo_weapon_guard` is enabled, known weapons are checked about every 0.05 s. Engine repair may maintain a 1 HP floor outside the bubble; there is no continuous weapon regeneration there.
 
 ## Healing details and limits
+
+v0.23 accumulates eligible repair time to handle the EXO-55's two 10-HP pools, which previously rounded every native heal to zero. Once the hull and every selected zone are full, `exo_leg_fix=1` restores the exact 0.75 speed penalty and separately stops the two recognized leg-fire effects through the game's guarded `StopEffect` interface. Cleanup also runs when speed is already normal; other effect slots and other mech entities are preserved. The user confirmed movement recovery during a temporary faster-heal diagnostic. Native fire cleanup passes offline tests and live code checks; its visible result still needs v0.23 game testing. See [investigation](docs/v0.23机甲维修与火焰.md).
+
 The game subtracts damage from its own saved copy of the HP, not from the value this mod writes. v0.12 hunted for
 that copy by scanning memory (spread across frames, no freeze, but 15-20 s per vehicle and a re-scan every match).
 v0.13 instead enables the game's built-in regeneration, so the game keeps both copies in sync and no scan is needed.
@@ -75,6 +78,8 @@ python tests/native_heal_test.py # native regen: enable config / no HP write / r
 python tests/native_guard_test.py# refuses to write when the config header does not look right
 python tests/part_regen_test.py   # all 38 parts / individual selection / layout and restore guards
 python tests/exo_repair_test.py   # mech speed / upgraded arms / native attachment / death guards
+python tests/exo_leg_effect_test.py # EXO-55 integer pools / native leg fire stop / entity isolation
+python tests/repair_native_test.py # native repair / tyre parameters / selection and interface guards
 python tests/weapon_fault_test.py# real weapon configs / failure hysteresis / ammo escrow and retries
 python tests/shield_fault_test.py # real pools / independent bash and flak / identity / restore retries
 python tests/tyre_fault_test.py  # captured wheel centres / puncture dispatch / restore and generation guards

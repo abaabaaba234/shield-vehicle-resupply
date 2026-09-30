@@ -34,14 +34,14 @@ def maps(mem, at, entries, pairs):
         mem.w(entries + slot * 8, U(key) + U(row))
 
 
-def fixture(resource=EXO):
+def fixture(resource=EXO, health_fixture='exo49_health_filediver.bin'):
     mem, lua, cfg, rec, logs, samples = make()
     # Replace the harness FRV with the actual filediver EXO-49 config.
     mem.w(0x20000000 + 0xF32F18, Q(int(resource, 16)))
     mem.w(0x40000000, bytes(1002 * 16))
     mem.w(0x40000000 + int(resource, 16) % 1002 * 16, Q(int(resource, 16)) + U(3) + U(0))
-    blob = (ROOT / 'tests/fixtures/exo49_health_filediver.bin').read_bytes()
-    if resource != EXO:
+    blob = (ROOT / 'tests/fixtures' / health_fixture).read_bytes()
+    if resource == ARM:
         # Minimal arm-shaped Health config; the actual upgraded resource is tested in roster.
         blob = bytearray(blob)
         blob[:4] = I(800)

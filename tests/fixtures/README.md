@@ -58,3 +58,17 @@ node layout. Two attempted isolated-damage recordings captured no changes,
 so the fixture does not establish a live damage-to-index correlation.
 Tests reorder the entries to check selection by geometry rather than
 array order. Native damage and physics calls are mocked.
+
+`exo55_health_live_v0.23.bin` is the 0x5650-byte runtime Health configuration
+captured read-only from the authoritative EXO-55 on 2026-10-01 at 05:06.
+It contains six large pools plus two 10-HP pools. The test replays the native
+float32 multiply/add and integer truncation responsible for stalled repairs.
+`exo55_effect_reference_filediver.bin` is the 0xF48-byte EffectReferenceComponent
+record extracted from the local public filediver entity dataset during that
+investigation. Slots 4/5 name the left/right leg fires, sharing particle resource
+1b9236a0c8137ed1 with different leg nodes and OnStop strategy 2.
+`exo_leg_effect_native_v0.23.json` contains only the reviewed code spans from a
+read-only game.dll capture for the StopEffect wrapper, callee and config getter.
+Every span also matched the current process at 05:41. Tests mock the native
+effect call and its engine-managed handle cleanup; they prove guarded selection
+and retries, not that visible flames disappear in the game.

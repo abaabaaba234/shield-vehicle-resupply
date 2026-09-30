@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply
--- Shield Vehicle Resupply v0.22
+-- Shield Vehicle Resupply v0.23
 -- Native read layer: DRIVER HUD 1.4.5 / HUD 1.11.1, Copyright (c) 2026 FireScallion, MIT License
 -- (see third_party/LICENSE-DRIVER-HUD.txt). Writes are added by this mod.
 local N=(function()
@@ -510,7 +510,7 @@ local RepairNative=(function()
 -- It never scans or patches executable pages. All calls run in the game's Lua update.
 return function(N, log)
     local ffi = require('ffi')
-    local R = { cache = {}, maps = {}, observations = {}, calls = 0, fixed = 0, legs_fixed = 0, next_check = 0 }
+    local R = { cache = {}, maps = {}, observations = {}, calls = 0, fixed = 0, legs_fixed = 0, leg_fires_stopped = 0, next_check = 0 }
     local exo_types = {['79e4b3d2da5e45e3']=true, ['c2d449ecf7facab1']=true,
         ['7b2326f6fd9c8069']=true, ['35dbf54f016f3624']=true}
     -- Vehicle Supply Tower's known arm resources; upgrades use observed ammo caps.
@@ -522,6 +522,9 @@ return function(N, log)
     local wheel_names = {'fed0a478', 'f3cb00ad', 'c6bf05a9', 'f12186b7'}
     local U32 = 4294967296
     local signatures = {
+        -- Script StopEffect wrapper: entity, name, node=0, replicate=1, queued=false.
+        effect_stop = {0x4DDE80, '48 83 EC 38 48 8B 01 44 8B C2 48 8B 0D ?? ?? ?? ?? 45 33 C9 C6 44 24 28 00 C7 44 24 20 01 00 00 00 8B 50 08 E8 ?? ?? ?? ?? 48 83 C4 38 C3'},
+        effect_config = {0x4FC3A0, '48 85 C9 74 71 48 8B 05 ?? ?? ?? ?? 44 8B C1 4C 8B 90 B8 27 F1 00 48 B8 BF A0 2F E8 0B FA 82 BE 48 F7 E1 48 C1 EA 0A 69 C2 60 05 00 00 44 2B C0'},
         -- Reviewed input dispatcher and per-entity Weapon table on the captured build.
         bash = {0x7406F0, '48 8B 46 40 48 8B 4E 58 45 8B F1 48 89 4C 24 58 4E 8B 2C F0 4F 8D 3C B6 48 8B 46 50 48 89 44 24 60 4C 89 6C 24 70 4C 89 7C 24 68 42 8B 04 F8 0F BA E0 0D'},
         bash_table = {0x744AF7, '44 8B 49 30 45 33 C0 44 8B 59 38 41 8B D0 44 0F AF DB 45 8D 71 FF 45 85 C9 74 2E 48 8B 71 28 8B 69 34'},
@@ -533,6 +536,7 @@ return function(N, log)
         attach = {0x4A52B0, '48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 3B 15 ?? ?? ?? ?? 4C 8B 15 ?? ?? ?? ?? 74 ?? 45 8B 4A 20 45 33 C0 41 8B 5A 28 0F AF DA 41 8D 69 FF 45 85 C9 74 ?? 49 8B 7A 18 41 8B 72 24 0F 1F 40 00 66 66 0F 1F 84 00 00 00 00 00 8B C5 41 8D 0C 18 48 23 C8 8B 04 CF 4C 8D 1C CF 3B C6 74 ?? 3B C2 74 ?? 41 FF C0 45 3B C1 72 ?? 32 C0 48 8B 5C 24 08 48 8B 6C 24 10 48 8B 74 24 18 48 8B 7C 24 20 C3 3B C2 75 ?? 41 8B 43 04 83 F8 FF 74 ?? 48 69 C8 ?? ?? ?? ?? 49 8B 42 ?? 83 3C 01 00 0F 95 C0 EB ??'},
     }
     local ctypes = {
+        effect_stop = 'void (*)(void *, uint32_t, uint32_t, uint32_t, uint32_t, bool)',
         heal = 'void (*)(void *, uint32_t, float)',
         query = 'uint64_t (*)(uint32_t, uint32_t, void *)',
         get = 'uint64_t (*)(uint32_t, uint32_t, void *)',
@@ -652,6 +656,26 @@ return function(N, log)
             'shield bash Weapon root/query differs')
         return {root=root,tbl=0x28,owners=0x40,rows=0x50,stride=0x28,bit=8}
     end
+    local function resolve_effects()
+        local p = N.base + signatures.effect_stop[1]
+        need(matches(p, signatures.effect_stop[2]), 'StopEffect wrapper guard')
+        local root, fn = rel(p + 0xA, 3, 7), rel(p + 0x24, 1, 5)
+        need(root == N.base + 0x3326570 and fn == N.base + 0x8ABB20, 'StopEffect root/function differs')
+        need(matches(fn, '48 89 5C 24 18 48 89 6C 24 20 56 57 41 54 41 56 41 57 48 83 EC 40'), 'StopEffect prologue')
+        need(matches(fn + 0x42, '4C 8B 59 20 44 8B 71 2C')
+            and matches(fn + 0x82, '49 8B 47 38 4E 8B 24 F0'), 'StopEffect table/owner layout')
+        need(matches(fn + 0xBC, 'E8 ?? ?? ?? ?? 4D 69 F6 18 02 00 00 44 8B ED 4D 03 77 48 4C 8D 78 28'), 'StopEffect config/row layout')
+        local cp = rel(fn + 0xBC, 1, 5)
+        need(cp == N.base + signatures.effect_config[1] and matches(cp, signatures.effect_config[2])
+            and rel(cp + 5, 3, 7) == N.base + N.roots.network
+            and matches(cp + 0x7E, '8B 48 08 48 69 C1 48 0F 00 00 48 05 00 56 00 00 49 03 C2 C3'), 'EffectReference configuration guard')
+        need(matches(fn + 0xD6, '41 39 7F 10') and matches(fn + 0xF5, '41 8B 4F 24 83 E9 01 74 31 83 F9 01 75 49'), 'StopEffect name/strategy layout')
+        need(matches(fn + 0x115, '41 FF 90 B0 02 00 00') and matches(fn + 0x141, '41 FF 90 A0 02 00 00')
+            and matches(fn + 0x148, '41 89 2C 24'), 'StopEffect particle cleanup')
+        need(matches(fn + 0x193, 'B9 00 73 6B 13')
+            and matches(fn + 0x1AD, '41 FF C5 49 83 C7 50 49 83 C4 04 41 83 FD 20'), 'StopEffect replication/32-slot layout')
+        return {root=root, fn=fn, tbl=0x20, owners=0x38, rows=0x48, stride=0x218}
+    end
     function R.ensure(now)
         if not N.ready then return false end
         if R.base == N.base and now < R.next_check then return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil end
@@ -659,7 +683,7 @@ return function(N, log)
         N.win.begin_sample()
         local exe_ok, exe = pcall(resolve_exe)
         R.exe = exe_ok and exe or nil
-        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach, bash = resolve_bash}) do
+        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach, bash = resolve_bash, effects = resolve_effects}) do
             local ok, value = pcall(resolve)
             R[name] = ok and value or nil
             local status = ok and 'ok' or tostring(value)
@@ -755,17 +779,15 @@ return function(N, log)
         g:validate()
         return pd, why, chain
     end
-    -- The first float in the guarded 13-float StatModifier row is movement speed.
-    -- Health/zone maxima are read fresh here; a stale "full" snapshot cannot cure a leg.
-    function R.fix_leg(d, cfg, zones, write_float, config_address)
-        if not exo_types[d.resource] then return false, 'not an exosuit' end
-        if not R.stats then return false, R.stats_status end
+    -- Shared fresh proof for movement and particle repairs; never trust a cached full snapshot.
+    local function fully_repaired(d, cfg, zones, config_address)
+        if not exo_types[d.resource] then return nil, 'not an exosuit' end
         local g, hm, rec = owner_graph(d)
         need(config_address(g, g:root('network'), hm, d) == cfg, 'leg Health config owner changed')
         need(N.u32(g:watch(rec + 0x19C, 4), 0) == 0, 'exosuit is dead')
         local mx = N.i32(g:watch(cfg, 4), 0)
         need(mx > 0 and mx <= 10000000, 'invalid exosuit maximum')
-        if N.i32(g:watch(rec + 0x14, 4), 0) < mx then return false, 'exosuit is not fully repaired' end
+        if N.i32(g:watch(rec + 0x14, 4), 0) < mx then return nil, 'exosuit is not fully repaired' end
         local has_leg, count = false, 0
         local state = N.u32(g:watch(rec + 0x20, 4), 0)
         for _, z in ipairs(zones) do
@@ -778,11 +800,18 @@ return function(N, log)
             if z.hash == '87b05ff4' or z.hash == '64a3fa1d' then has_leg = true end
             if zm > 0 and (N.i32(g:watch(rec + 0xF8 + z.i * 4, 4), 0) < zm
                 or (z.i < 16 and math.floor(state / 4 ^ z.i) % 4 == 2)) then
-                return false, 'exosuit is not fully repaired'
+                return nil, 'exosuit is not fully repaired'
             end
         end
         need(has_leg, 'no known exosuit leg zone')
         if count < 38 then need(N.u32(g:watch(cfg + 0x208 + count * 0x228 + 0x60, 4), 0) == 0, 'incomplete leg zone list') end
+        return g
+    end
+    -- The first float in the guarded 13-float StatModifier row is movement speed.
+    function R.fix_leg(d, cfg, zones, write_float, config_address)
+        if not R.stats then return false, R.stats_status end
+        local g, why = fully_repaired(d, cfg, zones, config_address)
+        if not g then return false, why end
         local sm = N.ptr(g:watch(R.stats.root, 8), 0)
         local row = g:lookup(g:table(sm + R.stats.tbl), d.entity)
         if row == nil then return false, 'no stat modifier row' end
@@ -794,6 +823,72 @@ return function(N, log)
         R.legs_fixed = R.legs_fixed + 1
         log('exo leg repaired %s ent=%d speed=0.75->1.0 (fully repaired)', d.resource, d.entity)
         return true
+    end
+    local leg_fire = {['a1d3345e']='2b57c939', ['4a3fa896']='a5bfa032'}
+    local function effect_access(d, cfg, zones, config_address)
+        local g, why = fully_repaired(d, cfg, zones, config_address)
+        if not g then return nil, why end
+        local fx = R.effects
+        local manager = N.ptr(g:watch(fx.root, 8), 0)
+        local row, fd = g:component(manager, d.entity, fx.tbl, fx.owners)
+        if row == nil then return nil, 'no effect reference row' end
+        need(N.same(fd, d) and fd.flags % 2 == 1, 'leg effect owner changed')
+        local rows = N.ptr(g:watch(manager + fx.rows, 8), 0) + row * fx.stride
+        local net = g:root('network')
+        local settings = N.ptr(g:watch(net + 0xF127B8, 8), 0)
+        local start, ecfg = N.mod64hex(d.resource, 1360), nil
+        for step = 0, 63 do
+            local entry = g:watch(settings + ((start + step) % 1360) * 16, 16)
+            local resource = N.hex64(entry, 0)
+            if resource == d.resource then
+                local index = N.u32(entry, 8)
+                need(index < 1360, 'EffectReference settings index')
+                ecfg = settings + 0x5600 + index * 0xF48; break
+            elseif resource == '0000000000000000' then break end
+        end
+        need(ecfg ~= nil, 'no EffectReference configuration')
+        local particles, found = {}, {}
+        for i = 0, 31 do
+            local setting = g:watch(ecfg + 8 + i * 80, 80)
+            local name = string.format('%08x', N.u32(setting, 48))
+            if leg_fire[name] then
+                need(not found[name], 'duplicate leg fire name'); found[name] = true
+                need(N.hex64(setting, 0) == '1b9236a0c8137ed1'
+                    and string.format('%08x', N.u32(setting, 32)) == leg_fire[name]
+                    and N.u32(setting, 68) == 2, 'leg fire configuration differs')
+                particles[#particles + 1] = {name=N.u32(setting,48), at=rows + i*4}
+            end
+        end
+        if #particles ~= 2 then return nil, 'no recognized leg fire pair' end
+        return {g=g, manager=manager, cfg=ecfg, particles=particles}
+    end
+    function R.stop_leg_fire(d, cfg, zones, config_address)
+        if not R.effects then return false, R.effects_status end
+        -- Stop one active leg effect per service. Reacquire ownership/health on
+        -- the next service, including when movement speed is already normal.
+        local a, why = effect_access(d, cfg, zones, config_address)
+        if not a then return false, why end
+        for _, particle in ipairs(a.particles) do
+            if N.u32(a.g:watch(particle.at, 4), 0) ~= 0 then
+                a.g:validate()
+                need(rq(R.effects.root) == a.manager, 'leg effect manager changed')
+                R.invoke('effect_stop', R.effects.fn, pointer(a.manager), d.entity, particle.name, 0, 1, false)
+                local back, reason = effect_access(d, cfg, zones, config_address)
+                if not back then return false, reason end
+                need(back.manager == a.manager and back.cfg == a.cfg, 'leg effect owner changed after stop')
+                for _, current in ipairs(back.particles) do
+                    if current.name == particle.name then
+                        if N.u32(back.g:watch(current.at, 4), 0) ~= 0 then return false, 'leg effect stop readback failed' end
+                        back.g:validate()
+                        R.leg_fires_stopped = R.leg_fires_stopped + 1
+                        log('exo leg fire stopped %s ent=%d effect=%08x (native StopEffect)', d.resource, d.entity, particle.name)
+                        return true
+                    end
+                end
+                error('leg effect configuration changed after stop', 0)
+            end
+        end
+        return false, 'no active leg fire'
     end
     local function wheel_access(d)
         need(R.wheels ~= nil, R.wheels_status or 'wheel interface unavailable')
@@ -1593,7 +1688,7 @@ local C = {
     tires          = true,   -- FRV：用 VehicleApi 恢复完好轮胎参数和爆胎标志；模型不重建
     wheel_interval = 2.0,    -- 每辆 FRV 至多每隔这些秒修一个轮胎
     part_repair    = true,   -- 调用游戏维修函数处理已毁部位；整车接口要求所有部位均未禁用
-    exo_leg_fix    = true,   -- 机甲完全修好后恢复腿损坏留下的 0.75 移速倍率
+    exo_leg_fix    = true,   -- 机甲修满后恢复 0.75 移速倍率，并停止已确认的腿部火焰
     exo_weapon_guard = true, -- 非盾牌武器：1HP 故障锁存；修复严格超过 5% 后恢复使用
     exo_shield_guard = true, -- 大盾机甲：手臂/盾面任一区到 1HP，仅禁用盾击
     frv_tire_guard  = true,  -- 轮胎保留模型，1HP 后施加物理爆胎状态
@@ -2101,7 +2196,7 @@ local function rebuild_roster()
     local list = enumerate(hm, 0x1030, 0x1048, function(res) return res ~= nil and KIND[res] ~= nil end)
     local vehicles, by_unit, by_entity = {}, {}, {}
     for _, d in ipairs(list) do
-        local sk = d.entity .. ':' .. d.goid .. ':' .. d.resource
+        local sk = d.entity .. ':' .. d.goid .. ':' .. d.unit .. ':' .. d.resource
         local v = S.vstate[sk] or { kind = KIND[d.resource] }
         S.vstate[sk] = v; v.d = d; v.alive_at = S.clock
         vehicles[#vehicles + 1] = v
@@ -2605,6 +2700,7 @@ native_close = function(cfg, why)
     end
 end
 local function native_close_all(why)
+    for _, v in pairs(S.vstate) do v.repair_credit = nil end
     local list = {}
     for cfg in pairs(CFG_ON) do list[#list + 1] = cfg end
     for _, cfg in ipairs(list) do native_close(cfg, why) end
@@ -2689,7 +2785,7 @@ local function trace_wheels(v, data, zc, cfg, native_zones)
 end
 
 local function repair_parts(v, zones, data, rate, dt, key, cfg)
-    if rate <= 0 then return 0 end
+    if rate <= 0 then v.repair_credit = nil; return 0 end
     local d, changed = v.d, 0
     local function report(prefix, reason)
         local report_key = prefix .. key .. reason
@@ -2701,30 +2797,64 @@ local function repair_parts(v, zones, data, rate, dt, key, cfg)
     local mech = v.kind == 'exo' or v.kind == 'arm'
     local engine_vehicle = mech or (v.kind == 'frv' and C.frv_tire_guard)
     local damaged = engine_vehicle and i32(data, 0x14) < v.zcache.mx or false
+    local smallest = damaged and v.zcache.mx or nil
     local all_selected = true
     for _, z in ipairs(zones) do
         if z.max > 0 then
             if not part_enabled(d.resource, z.hash) then all_selected = false end
             local bits = z.i < 16 and math.floor(u32(data, 0x20) / 4 ^ z.i) % 4 or 0
-            if (z.hp > -1000000 and z.hp < (engine_vehicle and z.max or 1)) or bits == 2 then damaged = true end
+            if (z.hp > -1000000 and z.hp < (engine_vehicle and z.max or 1)) or bits == 2 then
+                damaged = true
+                smallest = math.min(smallest or z.max, z.max)
+            end
         end
     end
     if C.part_repair then
         if damaged and all_selected then
-            local ok, done, why = pcall(REPAIR.heal, d, math.min(1, rate * dt), v.kind == 'arm')
-            if ok and done then
-                changed = changed + 1
-                report('part repair', 'game repair function')
-            else report('part repair skip', tostring(ok and why or done)) end
+            local fraction = math.min(1, rate * dt)
+            if engine_vehicle then
+                -- Native repair truncates max*fraction to integer HP. Accumulate
+                -- eligible service time until even the smallest damaged pool can
+                -- gain a point (EXO-55 has two 10-HP pools). Carry the remainder;
+                -- increasing every call to 0.1 would multiply the configured rate.
+                local credit = v.repair_credit
+                if not credit or credit.cfg ~= cfg or credit.rate ~= rate
+                    or math.abs(S.clock - credit.at - dt) > 0.000001 then
+                    credit = {fraction=0, cfg=cfg, rate=rate}
+                end
+                credit.fraction = math.min(1, credit.fraction + fraction)
+                credit.at = S.clock; v.repair_credit = credit
+                fraction = math.min(1, math.floor(credit.fraction * smallest + 0.0000001) / smallest)
+            end
+            if fraction > 0 then
+                local ok, done, why = pcall(REPAIR.heal, d, fraction, v.kind == 'arm')
+                if ok and done then
+                    if v.repair_credit then
+                        v.repair_credit.fraction = math.max(0, v.repair_credit.fraction - fraction)
+                    end
+                    changed = changed + 1
+                    report('part repair', 'game repair function')
+                else
+                    v.repair_credit = nil
+                    report('part repair skip', tostring(ok and why or done))
+                end
+            end
         elseif damaged and not all_selected then
+            v.repair_credit = nil
             report('part repair skip', 'a part is disabled; game repair function affects all zones')
-        end
-    end
+        else v.repair_credit = nil end
+    else v.repair_credit = nil end
     if C.exo_leg_fix and v.kind == 'exo' and not damaged and all_selected then
         local ok, done, why = pcall(REPAIR.fix_leg, d, cfg, zones, W.f32, config_address)
         if ok and done then changed = changed + 1
         elseif not ok or (why and why ~= 'no 0.75 leg penalty' and why ~= 'no stat modifier row'
             and why ~= 'exosuit is not fully repaired') then report('exo leg repair skip', tostring(ok and why or done)) end
+        local fire_ok, stopped, reason = pcall(REPAIR.stop_leg_fire, d, cfg, zones, config_address)
+        if fire_ok and stopped then changed = changed + 1
+        elseif not fire_ok or (reason and reason ~= 'no active leg fire' and reason ~= 'no effect reference row'
+            and reason ~= 'no recognized leg fire pair' and reason ~= 'exosuit is not fully repaired') then
+            report('exo leg fire skip', tostring(fire_ok and reason or stopped))
+        end
     end
     if C.tires and v.kind == 'frv' and S.clock >= (v.next_wheel or 0) then
         v.next_wheel = S.clock + math.max(0.5, C.wheel_interval)
@@ -3273,9 +3403,9 @@ local function cmd_status()
     log('status: enabled=%s heal=%s test=%s native=%s weapon=%s vehicles=%d weapons=%d shields_cfg=%d shields_live=%d native_open=%d forced=%d writes=%d fails=%d',
         tostring(C.enabled), C.heal, tostring(C.test), tostring(N.ready), tostring(N.weapon_ready), #S.vehicles, #S.weapons, n, #S.shields,
         ncfg, W.forced or 0, W.writes, W.fails)
-    log('status: part_repair=%s exo_leg_fix=%s legs_fixed=%d health_guard=%s stat_guard=%s attach_guard=%s',
-        tostring(C.part_repair), tostring(C.exo_leg_fix), REPAIR.legs_fixed,
-        tostring(REPAIR.health_status), tostring(REPAIR.stats_status), tostring(REPAIR.attach_status))
+    log('status: part_repair=%s exo_leg_fix=%s legs_fixed=%d leg_fires_stopped=%d health_guard=%s stat_guard=%s attach_guard=%s effect_guard=%s',
+        tostring(C.part_repair), tostring(C.exo_leg_fix), REPAIR.legs_fixed, REPAIR.leg_fires_stopped,
+        tostring(REPAIR.health_status), tostring(REPAIR.stats_status), tostring(REPAIR.attach_status), tostring(REPAIR.effects_status))
     FAULT.status()
     TYRE.status()
     for _, d in ipairs(S.shields) do log('  shield %s ent=%d goid=%d at %s', d.resource, d.entity, d.goid, fmtpos(position_of(d))) end
@@ -3466,10 +3596,11 @@ local function tick(dt)
             end
             local ok, r = pcall(heal, v, step)
             if not ok then
+                v.repair_credit = nil
                 local k = v.d.entity .. tostring(r)
                 if not S.reported[k] then S.reported[k] = true; log('heal %s %d: %s', v.kind, v.d.entity, tostring(r)) end
             end
-        end
+        else v.repair_credit = nil end
     end
     native_idle('没有载具在罩子里')
     if C.ammo and N.weapon_ready then
@@ -3502,5 +3633,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.22 (盾臂双区故障独立控制盾击；破片炮按自身血量控制；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.23 (机甲小血池累计维修；修满后恢复移速并停止腿部燃烧特效；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

@@ -36,7 +36,7 @@ local C = {
     tires          = true,   -- FRV：用 VehicleApi 恢复完好轮胎参数和爆胎标志；模型不重建
     wheel_interval = 2.0,    -- 每辆 FRV 至多每隔这些秒修一个轮胎
     part_repair    = true,   -- 调用游戏维修函数处理已毁部位；整车接口要求所有部位均未禁用
-    exo_leg_fix    = true,   -- 机甲完全修好后恢复腿损坏留下的 0.75 移速倍率
+    exo_leg_fix    = true,   -- 机甲修满后恢复 0.75 移速倍率，并停止已确认的腿部火焰
     exo_weapon_guard = true, -- 非盾牌武器：1HP 故障锁存；修复严格超过 5% 后恢复使用
     exo_shield_guard = true, -- 大盾机甲：手臂/盾面任一区到 1HP，仅禁用盾击
     frv_tire_guard  = true,  -- 轮胎保留模型，1HP 后施加物理爆胎状态
@@ -544,7 +544,7 @@ local function rebuild_roster()
     local list = enumerate(hm, 0x1030, 0x1048, function(res) return res ~= nil and KIND[res] ~= nil end)
     local vehicles, by_unit, by_entity = {}, {}, {}
     for _, d in ipairs(list) do
-        local sk = d.entity .. ':' .. d.goid .. ':' .. d.resource
+        local sk = d.entity .. ':' .. d.goid .. ':' .. d.unit .. ':' .. d.resource
         local v = S.vstate[sk] or { kind = KIND[d.resource] }
         S.vstate[sk] = v; v.d = d; v.alive_at = S.clock
         vehicles[#vehicles + 1] = v
@@ -1048,6 +1048,7 @@ native_close = function(cfg, why)
     end
 end
 local function native_close_all(why)
+    for _, v in pairs(S.vstate) do v.repair_credit = nil end
     local list = {}
     for cfg in pairs(CFG_ON) do list[#list + 1] = cfg end
     for _, cfg in ipairs(list) do native_close(cfg, why) end
@@ -1132,7 +1133,7 @@ local function trace_wheels(v, data, zc, cfg, native_zones)
 end
 
 local function repair_parts(v, zones, data, rate, dt, key, cfg)
-    if rate <= 0 then return 0 end
+    if rate <= 0 then v.repair_credit = nil; return 0 end
     local d, changed = v.d, 0
     local function report(prefix, reason)
         local report_key = prefix .. key .. reason
@@ -1144,30 +1145,64 @@ local function repair_parts(v, zones, data, rate, dt, key, cfg)
     local mech = v.kind == 'exo' or v.kind == 'arm'
     local engine_vehicle = mech or (v.kind == 'frv' and C.frv_tire_guard)
     local damaged = engine_vehicle and i32(data, 0x14) < v.zcache.mx or false
+    local smallest = damaged and v.zcache.mx or nil
     local all_selected = true
     for _, z in ipairs(zones) do
         if z.max > 0 then
             if not part_enabled(d.resource, z.hash) then all_selected = false end
             local bits = z.i < 16 and math.floor(u32(data, 0x20) / 4 ^ z.i) % 4 or 0
-            if (z.hp > -1000000 and z.hp < (engine_vehicle and z.max or 1)) or bits == 2 then damaged = true end
+            if (z.hp > -1000000 and z.hp < (engine_vehicle and z.max or 1)) or bits == 2 then
+                damaged = true
+                smallest = math.min(smallest or z.max, z.max)
+            end
         end
     end
     if C.part_repair then
         if damaged and all_selected then
-            local ok, done, why = pcall(REPAIR.heal, d, math.min(1, rate * dt), v.kind == 'arm')
-            if ok and done then
-                changed = changed + 1
-                report('part repair', 'game repair function')
-            else report('part repair skip', tostring(ok and why or done)) end
+            local fraction = math.min(1, rate * dt)
+            if engine_vehicle then
+                -- Native repair truncates max*fraction to integer HP. Accumulate
+                -- eligible service time until even the smallest damaged pool can
+                -- gain a point (EXO-55 has two 10-HP pools). Carry the remainder;
+                -- increasing every call to 0.1 would multiply the configured rate.
+                local credit = v.repair_credit
+                if not credit or credit.cfg ~= cfg or credit.rate ~= rate
+                    or math.abs(S.clock - credit.at - dt) > 0.000001 then
+                    credit = {fraction=0, cfg=cfg, rate=rate}
+                end
+                credit.fraction = math.min(1, credit.fraction + fraction)
+                credit.at = S.clock; v.repair_credit = credit
+                fraction = math.min(1, math.floor(credit.fraction * smallest + 0.0000001) / smallest)
+            end
+            if fraction > 0 then
+                local ok, done, why = pcall(REPAIR.heal, d, fraction, v.kind == 'arm')
+                if ok and done then
+                    if v.repair_credit then
+                        v.repair_credit.fraction = math.max(0, v.repair_credit.fraction - fraction)
+                    end
+                    changed = changed + 1
+                    report('part repair', 'game repair function')
+                else
+                    v.repair_credit = nil
+                    report('part repair skip', tostring(ok and why or done))
+                end
+            end
         elseif damaged and not all_selected then
+            v.repair_credit = nil
             report('part repair skip', 'a part is disabled; game repair function affects all zones')
-        end
-    end
+        else v.repair_credit = nil end
+    else v.repair_credit = nil end
     if C.exo_leg_fix and v.kind == 'exo' and not damaged and all_selected then
         local ok, done, why = pcall(REPAIR.fix_leg, d, cfg, zones, W.f32, config_address)
         if ok and done then changed = changed + 1
         elseif not ok or (why and why ~= 'no 0.75 leg penalty' and why ~= 'no stat modifier row'
             and why ~= 'exosuit is not fully repaired') then report('exo leg repair skip', tostring(ok and why or done)) end
+        local fire_ok, stopped, reason = pcall(REPAIR.stop_leg_fire, d, cfg, zones, config_address)
+        if fire_ok and stopped then changed = changed + 1
+        elseif not fire_ok or (reason and reason ~= 'no active leg fire' and reason ~= 'no effect reference row'
+            and reason ~= 'no recognized leg fire pair' and reason ~= 'exosuit is not fully repaired') then
+            report('exo leg fire skip', tostring(fire_ok and reason or stopped))
+        end
     end
     if C.tires and v.kind == 'frv' and S.clock >= (v.next_wheel or 0) then
         v.next_wheel = S.clock + math.max(0.5, C.wheel_interval)
@@ -1716,9 +1751,9 @@ local function cmd_status()
     log('status: enabled=%s heal=%s test=%s native=%s weapon=%s vehicles=%d weapons=%d shields_cfg=%d shields_live=%d native_open=%d forced=%d writes=%d fails=%d',
         tostring(C.enabled), C.heal, tostring(C.test), tostring(N.ready), tostring(N.weapon_ready), #S.vehicles, #S.weapons, n, #S.shields,
         ncfg, W.forced or 0, W.writes, W.fails)
-    log('status: part_repair=%s exo_leg_fix=%s legs_fixed=%d health_guard=%s stat_guard=%s attach_guard=%s',
-        tostring(C.part_repair), tostring(C.exo_leg_fix), REPAIR.legs_fixed,
-        tostring(REPAIR.health_status), tostring(REPAIR.stats_status), tostring(REPAIR.attach_status))
+    log('status: part_repair=%s exo_leg_fix=%s legs_fixed=%d leg_fires_stopped=%d health_guard=%s stat_guard=%s attach_guard=%s effect_guard=%s',
+        tostring(C.part_repair), tostring(C.exo_leg_fix), REPAIR.legs_fixed, REPAIR.leg_fires_stopped,
+        tostring(REPAIR.health_status), tostring(REPAIR.stats_status), tostring(REPAIR.attach_status), tostring(REPAIR.effects_status))
     FAULT.status()
     TYRE.status()
     for _, d in ipairs(S.shields) do log('  shield %s ent=%d goid=%d at %s', d.resource, d.entity, d.goid, fmtpos(position_of(d))) end
@@ -1909,10 +1944,11 @@ local function tick(dt)
             end
             local ok, r = pcall(heal, v, step)
             if not ok then
+                v.repair_credit = nil
                 local k = v.d.entity .. tostring(r)
                 if not S.reported[k] then S.reported[k] = true; log('heal %s %d: %s', v.kind, v.d.entity, tostring(r)) end
             end
-        end
+        else v.repair_credit = nil end
     end
     native_idle('没有载具在罩子里')
     if C.ammo and N.weapon_ready then
@@ -1945,5 +1981,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.22 (盾臂双区故障独立控制盾击；破片炮按自身血量控制；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.23 (机甲小血池累计维修；修满后恢复移速并停止腿部燃烧特效；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }
