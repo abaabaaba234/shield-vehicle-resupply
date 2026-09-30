@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply
--- Shield Vehicle Resupply v0.19
+-- Shield Vehicle Resupply v0.20
 -- Native read layer: DRIVER HUD 1.4.5 / HUD 1.11.1, Copyright (c) 2026 FireScallion, MIT License
 -- (see third_party/LICENSE-DRIVER-HUD.txt). Writes are added by this mod.
 local N=(function()
@@ -532,6 +532,7 @@ return function(N, log)
         query = 'uint64_t (*)(uint32_t, uint32_t, void *)',
         get = 'uint64_t (*)(uint32_t, uint32_t, void *)',
         set = 'uint64_t (*)(uint32_t, uint32_t, void *)',
+        damage = 'void (*)(void *, uint32_t)',
     }
     local functions = {}
     pcall(ffi.cdef, 'size_t __stdcall VirtualQuery(const void *, void *, size_t);')
@@ -611,7 +612,11 @@ return function(N, log)
         need(get and set and get ~= set and get <= 0xF8 and set <= 0xF8 and get % 8 == 0 and set % 8 == 0, 'wheel API slots')
         local api = rel(p + 0xEB, 3, 7)
         need(api == rel(p + 0x114, 3, 7), 'VehicleApi roots differ')
-        return {query = rel(p + 0xB3, 3, 7), api = api, get = get, set = set}
+        local damage_guard = 'F3 0F 10 87 64 01 00 00 4C 8D 44 24 20 F3 0F 10 4C 24 2C 8B D5 48 8B 05 ?? ?? ?? ?? 8B CB F3 0F 11 44 24 20 F3 0F 59 8F 68 01 00 00 C6 44 24 48 01 F3 0F 10 44 24 34 0F 5A C0 F3 0F 11 4C 24 2C F2 0F 59 05 ?? ?? ?? ?? F3 0F 10 4C 24 30 F3 0F 59 0D ?? ?? ?? ?? 66 0F 5A C0 F3 0F 11 4C 24 30 F3 0F 11 44 24 34 F3 0F 10 05 ?? ?? ?? ?? F3 0F 11 44 24 38 FF 50 48'
+        local damage = get==0x40 and set==0x48 and matches(p+0xFF,damage_guard)
+            and matches(p+0xA3,'48 8B 43 58 48 8B 1C C8 48 8B CB E8')
+        return {query = rel(p + 0xB3, 3, 7), api = api, get = get, set = set,
+            damage=damage and p or nil, vehicle_root=rel(p+0x2F,3,7),damage_guard=damage_guard}
     end
     local function resolve_stat()
         local p = N.base + signatures.stat[1]
@@ -810,13 +815,61 @@ return function(N, log)
         need(offset and offset < 0x1000000, 'wheel resource header offset')
         local header = resource + offset
         need(r32(header) == 0x20575256 and r32(header + 4) == 4, 'FRV wheel resource must contain four wheels')
-        return {h = h, get = get, set = set}
+        return {h = h, get = get, set = set,header=header}
     end
     local function get_wheel(a, index)
         local b = ffi.new('uint8_t[48]')
         if tonumber(R.invoke('get', a.get, a.h, index, b)) == 0 then return nil end
         local s = ffi.string(b, 48)
         return s:byte(0x29) <= 1 and s or nil
+    end
+    -- Runtime VRW centres identify physical wheels independently of Health order.
+    -- Only the two known FRV resources and the captured axle/centre schema qualify.
+    function R.tyre_snapshot(d)
+        need(d.resource=='9b2140378640432e' or d.resource=='cc21c7ffd3ebefb9','unsupported tyre resource')
+        local a=wheel_access(d); local map,seen,values={},{},{}
+        for i=0,3 do
+            local off=r32(a.header+8+i*4)
+            need(off and off>=24 and off<=0x10000,'wheel resource offset')
+            local raw=read(a.header+off,24);need(raw,'wheel centre unreadable')
+            local f=ffi.new('float[3]');ffi.copy(f,raw:sub(13,24),12)
+            local x,y,z=tonumber(f[0]),tonumber(f[1]),tonumber(f[2])
+            local axle,steered=N.u32(raw,0),N.u32(raw,4)
+            need(x==x and y==y and z==z and math.abs(x)>=0.5 and math.abs(x)<=3
+                and math.abs(y)>=0.5 and math.abs(y)<=4 and math.abs(z)<=1,'unknown FRV wheel centre')
+            need((axle==1 and steered==0 and y>0) or (axle==2 and steered==1 and y<0),'unknown FRV axle layout')
+            local hash=y>0 and (x<0 and 'fed0a478' or 'f3cb00ad') or (x<0 and 'c6bf05a9' or 'f12186b7')
+            need(not seen[hash],'duplicate FRV wheel location');seen[hash]=true;map[i]=hash
+            values[i]=get_wheel(a,i);need(values[i],'wheel parameters unavailable')
+        end
+        return {h=a.h,map=map,values=values}
+    end
+    function R.damage_wheel(d,index,hash)
+        need(R.wheels and R.wheels.damage,'wheel damage transformation guard unavailable')
+        need(type(index)=='number' and index>=0 and index<=3 and index%1==0,'wheel index')
+        local before=R.tyre_snapshot(d)
+        need(before.map[index]==hash,'wheel location changed')
+        if before.values[index]:byte(0x29)==1 then return before.values[index],before.h end
+        local g=N.sample_graph();local vm=N.ptr(g:watch(R.wheels.vehicle_root,8),0)
+        local j,vd=g:component(vm,d.entity,0x40,0x58)
+        need(j~=nil and N.same(vd,d) and vd.flags%2==1,'vehicle damage owner changed')
+        g:roundtrip(g:root('network'),vd);g:validate()
+        local fresh=wheel_access(d);need(fresh.h==before.h,'wheel handle changed before damage')
+        R.invoke('damage',R.wheels.damage,pointer(vd.address),index)
+        local back=R.tyre_snapshot(d)
+        need(back.h==before.h and back.map[index]==hash and back.values[index]:byte(0x29)==1,'wheel damage readback failed')
+        return back.values[index],back.h
+    end
+    function R.restore_guard_wheel(d,index,hash,expected,intact,handle)
+        local current=R.tyre_snapshot(d)
+        need(current.h==handle and current.map[index]==hash,'guarded wheel identity changed')
+        if current.values[index]:byte(0x29)==0 then return true end
+        need(current.values[index]==expected,'guarded wheel parameters changed externally')
+        need(type(intact)=='string' and #intact==48 and intact:byte(0x29)==0,'intact wheel snapshot')
+        local a=wheel_access(d);need(a.h==handle,'wheel handle changed before restore')
+        local buffer=ffi.new('uint8_t[48]');ffi.copy(buffer,intact,48)
+        R.invoke('set',a.set,a.h,index,buffer)
+        return get_wheel(a,index)==intact
     end
     -- Health zone indices and VehicleApi wheel indices are different namespaces.
     -- Learn only unambiguous simultaneous damage, never infer an index from its name/order.
@@ -949,7 +1002,9 @@ return function(N, W, R, C, log, ammo_components)
         ['0736bee2d6328726']={name='EXO-51 flamethrower',zone='aa1db0b0'},
         ['17c5d12d8d5dee2c']={name='EXO-51 AT cannon',zone='372f0418'},
         ['df51fe8d62f294be']={name='EXO-55 flak cannon',zone='372f0418'},
-    } -- Shield resource 65489809a8181b96 deliberately has no entry.
+        ['65489809a8181b96']={name='EXO-55 shield arm',zone='fd7c9885',shield=true,
+            zones={{hash='fd7c9885',max=-1},{hash='b0ef49f8',max=5000}}},
+    }
     local function key(d) return d.entity..':'..d.goid..':'..d.unit..':'..d.resource end
     local function need(v, s) if not v then error(s, 0) end end
     local function report(d, why)
@@ -964,21 +1019,34 @@ return function(N, W, R, C, log, ammo_components)
         need(j ~= nil and N.same(hd,d) and hd.flags % 2 == 1, 'weapon Health owner/authority changed')
         local rec = N.ptr(g:watch(hm+0x1058,8),0)+j*0x1B8
         local data = g:read(rec,0x1B8)
+        g:watch(rec+0x19C,4)
         need(allow_dead or N.u32(data,0x19C)==0, 'already engine-dead; spawn a new mech')
         local cfg = F.config_address(g,net,hm,d)
         local mx = N.i32(g:watch(cfg,4),0)
         need(mx >= 20 and mx <= 1000000, 'invalid weapon maximum')
         local model = F.models[d.resource]
         need(model ~= nil, 'unsupported weapon resource')
-        local z = cfg+0x208
-        need(string.format('%08x',N.u32(g:watch(z+0x60,4),0)) == model.zone
-            and N.u32(g:watch(z+0x228+0x60,4),0)==0, 'weapon must have its known single damage zone')
-        local zm = N.i32(g:watch(z+0xE8,4),0)
-        if zm == -1 then zm = mx end
-        need(zm == mx and N.i32(g:watch(cfg+0x40+0xE8,4),0)==-1, 'weapon/default zone maximum changed')
-        -- Named weapon zones already have a separate pool in filediver's configs.
-        need(g:watch(z+0xF8,4)=='\0\0\0\0', 'unexpected weapon-to-main damage contribution')
-        for _, base in ipairs({cfg+0x40,z}) do
+        need(N.i32(g:watch(cfg+0x40+0xE8,4),0)==-1, 'default zone maximum changed')
+        local parts, bases = {}, {cfg+0x40}
+        for i, expected in ipairs(model.zones or {{hash=model.zone,max=mx}}) do
+            local z=cfg+0x208+(i-1)*0x228
+            need(string.format('%08x',N.u32(g:watch(z+0x60,4),0))==expected.hash,
+                'weapon damage zone identity changed')
+            local rawmax=N.i32(g:watch(z+0xE8,4),0)
+            local zm=rawmax==-1 and mx or rawmax
+            need(zm==(expected.max==-1 and mx or expected.max), 'weapon zone maximum changed')
+            local contribution=g:read(z+0xF8,4)
+            if model.shield and i==1 then
+                need(contribution=='\0\0\128\63' or contribution=='\0\0\0\0', 'unexpected shield-arm damage contribution')
+            else need(contribution=='\0\0\0\0', 'unexpected weapon-to-main damage contribution') end
+            local hp=N.i32(data,0xF8+(i-1)*4)
+            if i==1 then hp=math.min(hp,N.i32(data,0x14)) end
+            need(hp>-1000000 and hp<=zm, 'invalid effective weapon HP')
+            parts[#parts+1]={hash=expected.hash,mx=zm,hp=hp,index=i-1,rawmax=rawmax}
+            bases[#bases+1]=z
+        end
+        need(N.u32(g:watch(cfg+0x208+#parts*0x228+0x60,4),0)==0, 'unexpected additional weapon damage zone')
+        for _, base in ipairs(bases) do
             for o=0xF0,0xF4 do need(g:read(base+o,1):byte(1)<=1, 'invalid death flags') end
             need(N.i32(g:read(base+0xEC,4),0)==0 and g:read(base+0xF1,3)=='\0\0\0', 'unexpected constitution/death propagation')
         end
@@ -1002,11 +1070,10 @@ return function(N, W, R, C, log, ammo_components)
                 end
             end
         end
-        need(#slots > 0, 'no verified ammunition stores; protection not armed')
+        need(model.shield or #slots > 0, 'no verified ammunition stores; protection not armed')
         g:validate()
-        local hp = math.min(N.i32(data,0x14),N.i32(data,0xF8))
-        need(hp > -1000000 and hp <= mx, 'invalid effective weapon HP')
-        return {g=g,d=d,cfg=cfg,mx=mx,hp=hp,slots=slots,life=N.u32(data,0x19C),zone=model.zone}
+        return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=parts[1].hp,main_hp=N.i32(data,0x14),parts=parts,
+            slots=slots,life=N.u32(data,0x19C),zone=model.zone,model=model}
     end
     local function put(e, offset, value)
         local p, n = e.cfg+offset, #value
@@ -1020,9 +1087,15 @@ return function(N, W, R, C, log, ammo_components)
     end
     local function config_identity(e)
         local b = N.win.read(e.cfg,4)
-        local z = N.win.read(e.cfg+0x208+0x60,4)
-        if not b or not z then return nil end
-        return N.i32(b,0)==e.mx and string.format('%08x',N.u32(z,0))==e.zone
+        if not b then return nil end
+        if N.i32(b,0)~=e.mx then return false end
+        for i,part in ipairs(e.parts) do
+            local z=N.win.read(e.cfg+0x208+(i-1)*0x228+0x60,4)
+            local mx=N.win.read(e.cfg+0x208+(i-1)*0x228+0xE8,4)
+            if not z or not mx then return nil end
+            if string.format('%08x',N.u32(z,0))~=part.hash or N.i32(mx,0)~=part.rawmax then return false end
+        end
+        return true
     end
     local function close_config(e)
         local identity=config_identity(e)
@@ -1043,20 +1116,25 @@ return function(N, W, R, C, log, ammo_components)
     end
     local function arm_config(s)
         local e=F.configs[s.cfg]
-        if not e then e={cfg=s.cfg,mx=s.mx,zone=s.zone,orig={},wrote={},users=0}; F.configs[s.cfg]=e end
+        if not e then e={cfg=s.cfg,mx=s.mx,zone=s.zone,parts=s.parts,orig={},wrote={},users=0}; F.configs[s.cfg]=e end
         need(e.mx==s.mx and e.zone==s.zone and config_identity(e), 'protected config identity changed')
         e.users=e.users+1
         s.g:validate()
         -- Stop the named zone from killing its independent arm; Immortal lets the
         -- engine keep the zone alive. Default hits must not kill the separate main pool.
         local ready=true
-        for _, p in ipairs({{0x208+0xF4,'\0'}, {0x208+0xF0,'\1'},
-                            {0x40+0xF4,'\0'}, {0x40+0xF0,'\1'}, {0x40+0xF8,'\0\0\0\0'}}) do
+        local edits={{0x40+0xF4,'\0'}, {0x40+0xF0,'\1'}, {0x40+0xF8,'\0\0\0\0'}}
+        for i in ipairs(s.parts) do
+            local z=0x208+(i-1)*0x228
+            edits[#edits+1]={z+0xF4,'\0'}; edits[#edits+1]={z+0xF0,'\1'}
+            if s.model.shield and i==1 then edits[#edits+1]={z+0xF8,'\0\0\0\0'} end
+        end
+        for _, p in ipairs(edits) do
             if not put(e,p[1],p[2]) then ready=false end
         end
         if not ready then return false end
         if not e.logged then
-            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d parent_unit=%d/%08x chain=%s (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.parent.unit,s.parent.unit,s.chain)
+            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d parent_unit=%d/%08x chain=%s (Immortal; zones=%d)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.parent.unit,s.parent.unit,s.chain,#s.parts)
         end
         return true
     end
@@ -1106,26 +1184,41 @@ return function(N, W, R, C, log, ammo_components)
         local d=v.d
         local s=snapshot(d)
         local parent,why,chain=R.arm_parent(d,s.g); need(parent~=nil,why)
+        need(not s.model.shield or parent.resource=='35dbf54f016f3624', 'shield parent is not EXO-55')
         s.parent,s.chain=parent,chain
         local k=key(d)
         local st=F.states[k] or {d=d}; F.states[k]=st
-        st.seen=true; st.hp,st.mx=s.hp,s.mx
+        st.seen=true; st.hp,st.mx=s.hp,s.mx; st.parent=parent; st.parts=st.parts or {}
         local protected=arm_config(s)
         if not protected then report(d,'protection write incomplete; retrying') end
-        if s.hp<=1 and not st.broken then
-            st.broken=true; log('weapon failed %s ent=%d hp=%d/%d; disabled until >5%%',F.models[d.resource].name,d.entity,s.hp,s.mx)
+        st.own_broken=false
+        for i,part in ipairs(s.parts) do
+            local state=st.parts[i] or {}; st.parts[i]=state
+            state.hash,state.hp,state.mx=part.hash,part.hp,part.mx
+            if part.hp<=1 and not state.broken then
+                state.broken=true
+                log('weapon part failed %s ent=%d zone=%s hp=%d/%d; disabled until >5%%',s.model.name,d.entity,part.hash,part.hp,part.mx)
+            elseif state.broken and part.hp>part.mx*0.05 then state.broken=false end
+            st.own_broken=st.own_broken or state.broken==true
         end
-        if st.broken then
-            if s.hp>s.mx*0.05 then
-                if release_ammo(st,s) then
-                    st.broken=false
-                    log('weapon recovered %s ent=%d hp=%d/%d (>5%%); ammunition restored',F.models[d.resource].name,d.entity,s.hp,s.mx)
-                else report(d,'ammunition restore incomplete; retrying') end
-            elseif not hold_ammo(st,s) then report(d,'ammunition hold incomplete; retrying') end
-        end
-        if protected and s.hp<1 then
-            -- Use the engine repair to update its HP bookkeeping, at most one HP.
-            -- This is floor maintenance outside the shield, not background regeneration.
+        if protected and s.model.shield then
+            -- The shield's two pools have different maxima. A whole-arm heal
+            -- would also heal the other pool outside the bubble; only floor the
+            -- current, authoritative live component's depleted pool.
+            for _,part in ipairs(s.parts) do
+                if part.hp<1 then
+                    s.g:validate()
+                    local p=s.rec+0xF8+part.index*4
+                    local old=N.i32(N.win.read(p,4),0)
+                    if old<1 and not W.i32(p,old,1) then report(d,'shield floor write failed; retrying') end
+                end
+            end
+            if s.main_hp<1 then
+                s.g:validate()
+                local old=N.i32(N.win.read(s.rec+0x14,4),0)
+                if old<1 and not W.i32(s.rec+0x14,old,1) then report(d,'shield main floor write failed; retrying') end
+            end
+        elseif protected and s.hp<1 then
             local ok,why=R.heal(d,1/s.mx,true)
             if not ok then report(d,'floor maintenance: '..tostring(why)) end
             if ok then
@@ -1133,17 +1226,52 @@ return function(N, W, R, C, log, ammo_components)
                 if fresh.hp<1 then report(d,'engine floor readback still below 1 HP; inspect live behavior') end
             end
         end
+        return s,st
+    end
+    local function ammunition(s,st,blocked,why)
+        local d=s.d
+        if blocked and not st.broken then
+            st.broken=true; log('weapon failed %s ent=%d hp=%d/%d; disabled until >5%% (%s)',s.model.name,d.entity,s.hp,s.mx,why)
+        end
+        if st.broken then
+            if not blocked then
+                if release_ammo(st,s) then
+                    st.broken=false
+                    log('weapon recovered %s ent=%d hp=%d/%d (>5%%); ammunition restored',F.models[d.resource].name,d.entity,s.hp,s.mx)
+                else report(d,'ammunition restore incomplete; retrying') end
+            elseif not hold_ammo(st,s) then report(d,'ammunition hold incomplete; retrying') end
+        end
     end
     function F.step(vehicles)
         if not N.weapon_ready or not R.health or not R.attach then F.close(); return end
         N.win.begin_sample()
         for _, e in pairs(F.configs) do e.users=0 end
         for _, st in pairs(F.states) do st.seen=false end
+        local samples,shields={},{}
         for _, v in ipairs(vehicles) do
-            if F.models[v.d.resource] then
-                local ok,why=pcall(service,v)
-                if not ok then report(v.d,tostring(why)) end
+            local model=F.models[v.d.resource]
+            if model and ((model.shield and C.exo_shield_guard) or (not model.shield and C.exo_weapon_guard)
+                or (v.d.resource=='df51fe8d62f294be' and C.exo_shield_guard)) then
+                local ok,s,st=pcall(service,v)
+                if not ok then report(v.d,tostring(s))
+                else
+                    samples[#samples+1]={s=s,st=st}
+                    if model.shield then
+                        local k=key(s.parent); shields[k]=shields[k] or {}; shields[k][#shields[k]+1]=st
+                    end
+                end
             end
+        end
+        for _,sample in ipairs(samples) do
+            local s,st=sample.s,sample.st
+            local blocked,why=st.own_broken,'own damage zone'
+            if s.d.resource=='df51fe8d62f294be' and s.parent.resource=='35dbf54f016f3624' and C.exo_shield_guard then
+                local paired=shields[key(s.parent)]
+                if not paired or #paired~=1 then blocked=true; why='shield companion unavailable or ambiguous'
+                elseif paired[1].own_broken then blocked=true; why='shield arm or shield plate failed' end
+            end
+            local ok,err=pcall(ammunition,s,st,blocked,why)
+            if not ok then report(s.d,tostring(err)) end
         end
         for cfg,e in pairs(F.configs) do
             if e.users==0 and close_config(e) then F.configs[cfg]=nil end
@@ -1187,12 +1315,186 @@ return function(N, W, R, C, log, ammo_components)
     function F.status()
         local n,b=0,0
         for _, st in pairs(F.states) do n=n+1; if st.broken then b=b+1 end end
-        log('weapon guard: enabled=%s weapons=%d failed=%d; fail at 1 HP, recover strictly >5%%; shield excluded',tostring(C.exo_weapon_guard),n,b)
+        log('weapon guard: enabled=%s shield_guard=%s components=%d failed=%d; fail at 1 HP, recover strictly >5%%',tostring(C.exo_weapon_guard),tostring(C.exo_shield_guard),n,b)
         for _, st in pairs(F.states) do
             log('  weapon %s ent=%d hp=%s/%s failed=%s held_ammo=%s',F.models[st.d.resource].name,st.d.entity,tostring(st.hp),tostring(st.mx),tostring(st.broken==true),tostring(st.ammo~=nil))
+            if F.models[st.d.resource].shield then
+                for _,part in ipairs(st.parts or {}) do log('    shield part zone=%s hp=%d/%d failed=%s',part.hash,part.hp,part.mx,tostring(part.broken==true)) end
+            end
         end
     end
     return F
+end
+
+end)()
+local TyreFault=(function()
+-- Preserve live FRV wheel models, with independent latched physical punctures.
+return function(N,W,R,C,log)
+    local T={states={},configs={},reports={}}
+    local hashes={'fed0a478','f3cb00ad','c6bf05a9','f12186b7'}
+    local function key(d)return d.entity..':'..d.goid..':'..d.unit..':'..d.resource end
+    local function need(v,s)if not v then error(s,0)end end
+    local function report(d,why)
+        local k=key(d)..':'..why
+        if not T.reports[k] then T.reports[k]=true;log('tyre guard skip ent=%d: %s',d.entity,why)end
+    end
+    local function snapshot(d)
+        need(d.resource=='9b2140378640432e' or d.resource=='cc21c7ffd3ebefb9','unknown FRV resource')
+        need(R.wheels and R.wheels.damage,'wheel damage transformation guard unavailable')
+        local g=N.sample_graph();local net,hm=g:root('network'),g:root('health')
+        g:roundtrip(net,d)
+        local j,hd=g:component(hm,d.entity,0x1030,0x1048)
+        need(j~=nil and N.same(hd,d) and hd.flags%2==1 and d.flags%2==1,'FRV Health owner/authority changed')
+        local rec=N.ptr(g:watch(hm+0x1058,8),0)+j*0x1B8
+        local data=g:read(rec,0x1B8)
+        g:watch(rec+0x14,4);g:watch(rec+0x19C,4)
+        need(N.i32(data,0x14)>0 and N.u32(data,0x19C)==0,'FRV hull is dead')
+        local cfg=T.config_address(g,net,hm,d)
+        local mx=N.i32(g:watch(cfg,4),0);need(mx==2400,'unexpected FRV hull maximum')
+        local hp={}
+        for i,hash in ipairs(hashes) do
+            local z=cfg+0x208+(i-1)*0x228
+            need(string.format('%08x',N.u32(g:watch(z+0x60,4),0))==hash
+                and N.i32(g:watch(z+0xE8,4),0)==350,'unexpected FRV wheel zone')
+            need(g:read(z+0xF8,4)=='\0\0\0\0' and N.i32(g:read(z+0xEC,4),0)==0,'unexpected wheel damage contribution')
+            need(g:read(z+0xF0,1):byte(1)<=1 and g:read(z+0xF4,1)=='\0','unexpected wheel death flags')
+            hp[i]=N.i32(data,0xF8+(i-1)*4)
+            need(hp[i]>-1000000 and hp[i]<=350,'invalid wheel HP')
+        end
+        local physics=R.tyre_snapshot(d);g:validate()
+        R.maps[d.resource]=physics.map
+        return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=hp,physics=physics}
+    end
+    local function identity(e)
+        local b=N.win.read(e.cfg,4);if not b then return nil end
+        if N.i32(b,0)~=2400 then return false end
+        for i,hash in ipairs(hashes) do
+            local z=e.cfg+0x208+(i-1)*0x228
+            local name,mx=N.win.read(z+0x60,4),N.win.read(z+0xE8,4)
+            if not name or not mx then return nil end
+            if string.format('%08x',N.u32(name,0))~=hash or N.i32(mx,0)~=350 then return false end
+        end
+        return true
+    end
+    local function restore_config(e)
+        local valid=identity(e)
+        if valid==nil then return false end
+        if not valid then log('tyre guard config identity changed; original bytes not written');return true end
+        local done=true
+        for p,original in pairs(e.orig) do
+            local cur=N.win.read(p,1)
+            if not cur then done=false
+            elseif cur==e.wrote[p] and cur~=original and not W.raw(p,1,cur,original) then done=false end
+        end
+        return done
+    end
+    local function arm_config(s)
+        local e=T.configs[s.cfg]
+        if not e then e={cfg=s.cfg,orig={},wrote={},users=0};T.configs[s.cfg]=e end
+        need(identity(e),'tyre guard config identity changed');e.users=e.users+1;s.g:validate()
+        local ready=true
+        for i in ipairs(hashes) do
+            local p=s.cfg+0x208+(i-1)*0x228+0xF0
+            local cur=N.win.read(p,1);need(cur and cur:byte(1)<=1,'wheel immortal field unreadable')
+            if e.orig[p]==nil then e.orig[p]=cur end
+            if cur=='\1' then e.wrote[p]=cur
+            elseif W.raw(p,1,cur,'\1') then e.wrote[p]='\1'
+            else ready=false end
+        end
+        if ready and not e.logged then
+            e.logged=true;log('tyre guard armed %s ent=%d: four 350-HP zones; VRW centres map physical indices',s.d.resource,s.d.entity)
+        end
+        return ready
+    end
+    local function restore_part(st,part)
+        if not part.wrote then return true end
+        local ok,done=pcall(R.restore_guard_wheel,st.d,part.api,part.hash,part.wrote,part.intact,part.handle)
+        if ok and done then part.wrote=nil;return true end
+        report(st.d,'wheel restore pending: '..tostring(done));return false
+    end
+    local function service(v)
+        local s=snapshot(v.d);local k=key(v.d)
+        local st=T.states[k] or {d=v.d,parts={}};T.states[k]=st;st.seen=true
+        local protected=arm_config(s)
+        if not protected then report(v.d,'wheel protection write incomplete; retrying');return end
+        for i,hash in ipairs(hashes) do
+            local part=st.parts[i] or {hash=hash};st.parts[i]=part;part.hp=s.hp[i]
+            local api
+            for j=0,3 do if s.physics.map[j]==hash then api=j end end
+            need(api~=nil,'missing physical wheel mapping')
+            if part.api~=nil then need(part.api==api and part.handle==s.physics.h,'wheel identity changed') end
+            part.api,part.handle=api,s.physics.h
+            local cur=s.physics.values[api]
+            if not part.intact and cur:byte(0x29)==0 and s.hp[i]>1 then part.intact=cur end
+            if s.hp[i]<=1 and not part.broken then
+                part.broken=true;log('tyre failed ent=%d zone=%s api=%d hp=%d/350',v.d.entity,hash,api,s.hp[i])
+            end
+            if part.broken and s.hp[i]>350*0.05 then
+                if restore_part(st,part) then
+                    part.broken=false;log('tyre recovered ent=%d zone=%s hp=%d/350 (>5%%)',v.d.entity,hash,s.hp[i])
+                end
+            end
+            if protected and s.hp[i]<1 then
+                s.g:validate()
+                if not W.i32(s.rec+0xF8+(i-1)*4,s.hp[i],1) then report(v.d,'wheel HP floor write failed; retrying') end
+            end
+            if part.broken and cur:byte(0x29)==0 then
+                need(part.intact,'no intact wheel parameters; spawn an intact FRV')
+                s.g:validate()
+                local raw,h=R.damage_wheel(v.d,api,hash)
+                part.wrote,part.handle=raw,h
+                log('tyre puncture applied ent=%d zone=%s api=%d: native physical damage, model retained by Immortal',v.d.entity,hash,api)
+            end
+        end
+    end
+    local function owner_gone(d)
+        local ok,gone=pcall(function()
+            local g=N.sample_graph();local fresh=g:net(g:root('network'),d.entity,true)
+            g:validate();return not fresh or not N.same(fresh,d)
+        end)
+        return ok and gone
+    end
+    function T.allowed(d,allowed)
+        local st=T.states[key(d)];if not st then return allowed end
+        local out={};for i=0,3 do out[i]=allowed[i] end
+        for _,part in pairs(st.parts) do if part.api~=nil and (part.broken or part.wrote) then out[part.api]=false end end
+        return out
+    end
+    function T.step(vehicles)
+        N.win.begin_sample()
+        for _,e in pairs(T.configs) do e.users=0 end
+        for _,st in pairs(T.states) do st.seen=false end
+        for _,v in ipairs(vehicles) do
+            if v.kind=='frv' then local ok,why=pcall(service,v);if not ok then report(v.d,tostring(why)) end end
+        end
+        for cfg,e in pairs(T.configs) do if e.users==0 and restore_config(e) then T.configs[cfg]=nil end end
+        for k,st in pairs(T.states) do
+            if not st.seen then
+                if owner_gone(st.d) then T.states[k]=nil
+                else
+                    local done=true;for _,part in pairs(st.parts) do if not restore_part(st,part) then done=false end end
+                    if done then T.states[k]=nil end
+                end
+            end
+        end
+    end
+    function T.close()
+        if not N.ready then return end
+        for cfg,e in pairs(T.configs) do if restore_config(e) then T.configs[cfg]=nil end end
+        for k,st in pairs(T.states) do
+            if owner_gone(st.d) then T.states[k]=nil
+            else
+                for _,part in pairs(st.parts) do restore_part(st,part) end
+            end
+        end
+    end
+    function T.reset()T.close();T.reports={}end
+    function T.status()
+        for _,st in pairs(T.states) do
+            for _,part in pairs(st.parts) do log('tyre guard ent=%d zone=%s api=%s hp=%s/350 failed=%s',st.d.entity,part.hash,tostring(part.api),tostring(part.hp),tostring(part.broken==true)) end
+        end
+    end
+    return T
 end
 
 end)()
@@ -1236,6 +1538,8 @@ local C = {
     part_repair    = true,   -- 调用游戏维修函数处理已毁部位；整车接口要求所有部位均未禁用
     exo_leg_fix    = true,   -- 机甲完全修好后恢复腿损坏留下的 0.75 移速倍率
     exo_weapon_guard = true, -- 非盾牌武器：1HP 故障锁存；修复严格超过 5% 后恢复使用
+    exo_shield_guard = true, -- 大盾机甲：手臂/盾面任一区到 1HP，禁用同机甲破片炮
+    frv_tire_guard  = true,  -- 轮胎保留模型，1HP 后施加物理爆胎状态
     net_heal       = true,   -- 用引擎 set_game_object_field 给坦克/FRV 车体（HUD 显示的网络血量）回血（v0.8b 实测 FRV 可行）
     hull_zones     = true,   -- 坦克/FRV：被打爆部位的 HP 数值也回满（模型不变），车体血量才会回（v0.8 推断：车体 = 上限 - 各部位损失）
     authority_only = true,   -- 只改本机有权威的组件（descriptor flags bit0）
@@ -1357,7 +1661,7 @@ local function read_settings()
         if f then
             f:write('# Shield Vehicle Resupply 设置。改完在 shield_resupply_cmd.txt 写 reload\n',
                 '# shield=<16位hex> 可写多行；weapon=<hex> 同理；ammo_max=<hex>:<字段>=<数值>\n',
-                'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=1\nwheel_interval=2\npart_repair=1\nexo_leg_fix=1\nexo_weapon_guard=1\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
+                'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=1\nwheel_interval=2\npart_repair=1\nexo_leg_fix=1\nexo_weapon_guard=1\nexo_shield_guard=1\nfrv_tire_guard=1\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
                 'ammo_rate=0.10\ncooldown=2\nauthority_only=1\nheal=native\nnative_zone=0x141\npart_regen=1\nnative_segments=1\nnative_force=1\n',
                 '# part=<16位资源hash>:<8位部位hash>=0|1，可写多行；parts 命令列出这些 hash\n')
             f:close()
@@ -1397,6 +1701,7 @@ local function read_settings()
         C.radius, C.heal, C.native_zone > 0 and string.format('+%x', C.native_zone) or 'off', tostring(C.test), tostring(C.revive), tostring(C.hull_zones), tostring(C.tires), tostring(C.ammo), n)
     log('settings: part_repair=%s exo_leg_fix=%s', tostring(C.part_repair), tostring(C.exo_leg_fix))
     log('settings: exo_weapon_guard=%s (non-shield weapons; fail at 1 HP, recover >5%%)',tostring(C.exo_weapon_guard))
+    log('settings: exo_shield_guard=%s frv_tire_guard=%s',tostring(C.exo_shield_guard),tostring(C.frv_tire_guard))
 end
 local function load_settings() read_settings(); rebuild_res() end
 
@@ -1518,6 +1823,7 @@ end
 
 local TEST_HOOK = rawget(_G, '__SVR_TEST')  -- 仅离线测试用
 local FAULT = WeaponFault(N, W, REPAIR, C, log, WEAPON_COMPONENTS)
+local TYRE = TyreFault(N,W,REPAIR,C,log)
 
 -- ---------------------------------------------------------------------------
 -- 状态
@@ -1540,6 +1846,7 @@ local function reset_context()
     S.wheel_trace, S.next_wheel_learn = nil, 0
     S.mech_trace = nil
     FAULT.reset()
+    TYRE.reset()
     S.next_fault=0
     REPAIR.reset()
 end
@@ -2007,6 +2314,7 @@ local function config_address(g, net, hm, d)
     error('no Health configuration', 0)
 end
 FAULT.config_address = config_address
+TYRE.config_address = config_address
 
 
 -- ---------------------------------------------------------------------------
@@ -2372,6 +2680,7 @@ local function repair_parts(v, zones, data, rate, dt, key, cfg)
         local ok, done, why
         if mapped then
             local allowed, partial = REPAIR.allowed(d, selected)
+            if C.frv_tire_guard then allowed=TYRE.allowed(d,allowed) end
             ok, done, why = pcall(REPAIR.repair_wheel, d, allowed)
             if ok and not done and partial and why == 'no selected blown tyre' then
                 why = 'no selected blown tyre with a confirmed API/health mapping; damage one tyre at a time to learn'
@@ -2544,7 +2853,7 @@ end
 
 local function refill(w, dt, observe_only)
     local d, comp = w.d, w.comp
-    if not observe_only and C.exo_weapon_guard and FAULT.blocked(d) then return 'weapon_failed' end
+    if not observe_only and (C.exo_weapon_guard or C.exo_shield_guard) and FAULT.blocked(d) then return 'weapon_failed' end
     if C.authority_only and d.flags % 2 ~= 1 then return 'no_authority' end
     local g = N.sample_graph()
     local net = g:root('network')
@@ -2905,6 +3214,7 @@ local function cmd_status()
         tostring(C.part_repair), tostring(C.exo_leg_fix), REPAIR.legs_fixed,
         tostring(REPAIR.health_status), tostring(REPAIR.stats_status), tostring(REPAIR.attach_status))
     FAULT.status()
+    TYRE.status()
     for _, d in ipairs(S.shields) do log('  shield %s ent=%d goid=%d at %s', d.resource, d.entity, d.goid, fmtpos(position_of(d))) end
 end
 
@@ -2936,9 +3246,9 @@ local function poll_commands()
         elseif c == 'netinfo' then cmd_netinfo()
         elseif c == 'netset' then cmd_netset()
         elseif c == 'recent' then cmd_recent(tonumber(line:match('recent%s+(%d+)')) or 40)
-        elseif c == 'reload' then native_close_all('reload'); FAULT.close(); load_settings()
+        elseif c == 'reload' then native_close_all('reload'); FAULT.close(); TYRE.close(); load_settings()
         elseif c == 'on' then C.enabled = true; log('enabled')
-        elseif c == 'off' then C.enabled = false; native_close_all('mod off'); FAULT.close(); log('disabled')
+        elseif c == 'off' then C.enabled = false; native_close_all('mod off'); FAULT.close(); TYRE.close(); log('disabled')
         elseif c == 'test' then C.test = not C.test; log('test mode = %s', tostring(C.test))
         elseif c then log('unknown command: %s (units|recent [n]|vehicles|parts|weapons|status|probe|healcfg|hptrace [secs]|heal native|write|off|reload|on|off|test)', c) end
     end
@@ -2964,7 +3274,7 @@ local function tick(dt)
         return
     end
     stage('native layout ok')
-    if C.enabled and (C.tires or C.part_repair or C.exo_leg_fix or C.exo_weapon_guard) then REPAIR.ensure(S.clock) end
+    if C.enabled and (C.tires or C.part_repair or C.exo_leg_fix or C.exo_weapon_guard or C.exo_shield_guard or C.frv_tire_guard) then REPAIR.ensure(S.clock) end
     if N.weapon_base ~= N.base then
         N.weapon_base = N.base
         N.win.begin_sample()
@@ -3048,15 +3358,16 @@ local function tick(dt)
             w.i = w.i + 1; if w.i > #w.marks then S.watch = nil end
         end
     end
-    if not C.enabled then native_close_all('mod off'); FAULT.close(); return end
+    if not C.enabled then native_close_all('mod off'); FAULT.close(); TYRE.close(); return end
     -- Prevention and failure latch also run outside the shield. Always sample
     -- before a repair pass, so healing cannot conceal a just-reached 1 HP state.
-    if C.exo_weapon_guard then
+    if C.exo_weapon_guard or C.exo_shield_guard or C.frv_tire_guard then
         if S.clock >= (S.next_fault or 0) or S.acc+dt >= C.tick then
             S.next_fault=S.clock+0.05
-            FAULT.step(S.vehicles)
+            if C.exo_weapon_guard or C.exo_shield_guard then FAULT.step(S.vehicles) else FAULT.close() end
+            if C.frv_tire_guard then TYRE.step(S.vehicles) else TYRE.close() end
         end
-    else FAULT.close() end
+    else FAULT.close(); TYRE.close() end
     S.acc = S.acc + dt
     if S.acc < C.tick then return end
     local step = math.min(S.acc, 1); S.acc = 0
@@ -3116,7 +3427,7 @@ local function tick(dt)
 end
 
 load_settings()
-if TEST_HOOK then TEST_HOOK(N, W, S, C, REPAIR, FAULT) end
+if TEST_HOOK then TEST_HOOK(N, W, S, C, REPAIR, FAULT, TYRE) end
 local previous = rawget(_G, 'update')
 rawset(_G, 'update', function(dt, ...)
     if type(dt) == 'number' and dt > 0 and dt < 1 then
@@ -3128,5 +3439,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.19 (按完整父 Unit 句柄关联机甲武器；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.20 (轮胎模型保护及大盾机甲故障联动；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

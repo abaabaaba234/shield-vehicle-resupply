@@ -42,3 +42,19 @@ The regression replays these exact handles and row prefixes in the mock
 component tables, with distinct entity IDs. It rejects generation changes,
 stale/ambiguous candidates and changes during sampling. It verifies parent
 association, not the engine's damage or firing behavior.
+
+`health_65489809a8181b96_filediver.bin` (EXO-55 shield arm) and
+`health_cc21c7ffd3ebefb9_filediver.bin` (second FRV resource) were extracted
+from the same public entity dataset on 2026-10-01. The shield has an
+800-HP main pool, a shoulder zone with maximum -1 (inherits 800), and a
+5000-HP plate zone. The FRV has the same four 350-HP wheel zone schema.
+
+`frv_wheel_centres_live.json` contains only four local wheel centres and
+adjacent axle fields captured read-only from a runtime VRW resource on
+2026-10-01; process addresses and handles are omitted. The `steered` name
+labels an observed adjacent field, not a verified steering interpretation.
+Wheel positions are inferred from these centres and the public vehicle
+node layout. Two attempted isolated-damage recordings captured no changes,
+so the fixture does not establish a live damage-to-index correlation.
+Tests reorder the entries to check selection by geometry rather than
+array order. Native damage and physics calls are mocked.

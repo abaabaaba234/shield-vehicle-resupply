@@ -25,6 +25,7 @@ return function(N, log)
         query = 'uint64_t (*)(uint32_t, uint32_t, void *)',
         get = 'uint64_t (*)(uint32_t, uint32_t, void *)',
         set = 'uint64_t (*)(uint32_t, uint32_t, void *)',
+        damage = 'void (*)(void *, uint32_t)',
     }
     local functions = {}
     pcall(ffi.cdef, 'size_t __stdcall VirtualQuery(const void *, void *, size_t);')
@@ -104,7 +105,11 @@ return function(N, log)
         need(get and set and get ~= set and get <= 0xF8 and set <= 0xF8 and get % 8 == 0 and set % 8 == 0, 'wheel API slots')
         local api = rel(p + 0xEB, 3, 7)
         need(api == rel(p + 0x114, 3, 7), 'VehicleApi roots differ')
-        return {query = rel(p + 0xB3, 3, 7), api = api, get = get, set = set}
+        local damage_guard = 'F3 0F 10 87 64 01 00 00 4C 8D 44 24 20 F3 0F 10 4C 24 2C 8B D5 48 8B 05 ?? ?? ?? ?? 8B CB F3 0F 11 44 24 20 F3 0F 59 8F 68 01 00 00 C6 44 24 48 01 F3 0F 10 44 24 34 0F 5A C0 F3 0F 11 4C 24 2C F2 0F 59 05 ?? ?? ?? ?? F3 0F 10 4C 24 30 F3 0F 59 0D ?? ?? ?? ?? 66 0F 5A C0 F3 0F 11 4C 24 30 F3 0F 11 44 24 34 F3 0F 10 05 ?? ?? ?? ?? F3 0F 11 44 24 38 FF 50 48'
+        local damage = get==0x40 and set==0x48 and matches(p+0xFF,damage_guard)
+            and matches(p+0xA3,'48 8B 43 58 48 8B 1C C8 48 8B CB E8')
+        return {query = rel(p + 0xB3, 3, 7), api = api, get = get, set = set,
+            damage=damage and p or nil, vehicle_root=rel(p+0x2F,3,7),damage_guard=damage_guard}
     end
     local function resolve_stat()
         local p = N.base + signatures.stat[1]
@@ -303,13 +308,61 @@ return function(N, log)
         need(offset and offset < 0x1000000, 'wheel resource header offset')
         local header = resource + offset
         need(r32(header) == 0x20575256 and r32(header + 4) == 4, 'FRV wheel resource must contain four wheels')
-        return {h = h, get = get, set = set}
+        return {h = h, get = get, set = set,header=header}
     end
     local function get_wheel(a, index)
         local b = ffi.new('uint8_t[48]')
         if tonumber(R.invoke('get', a.get, a.h, index, b)) == 0 then return nil end
         local s = ffi.string(b, 48)
         return s:byte(0x29) <= 1 and s or nil
+    end
+    -- Runtime VRW centres identify physical wheels independently of Health order.
+    -- Only the two known FRV resources and the captured axle/centre schema qualify.
+    function R.tyre_snapshot(d)
+        need(d.resource=='9b2140378640432e' or d.resource=='cc21c7ffd3ebefb9','unsupported tyre resource')
+        local a=wheel_access(d); local map,seen,values={},{},{}
+        for i=0,3 do
+            local off=r32(a.header+8+i*4)
+            need(off and off>=24 and off<=0x10000,'wheel resource offset')
+            local raw=read(a.header+off,24);need(raw,'wheel centre unreadable')
+            local f=ffi.new('float[3]');ffi.copy(f,raw:sub(13,24),12)
+            local x,y,z=tonumber(f[0]),tonumber(f[1]),tonumber(f[2])
+            local axle,steered=N.u32(raw,0),N.u32(raw,4)
+            need(x==x and y==y and z==z and math.abs(x)>=0.5 and math.abs(x)<=3
+                and math.abs(y)>=0.5 and math.abs(y)<=4 and math.abs(z)<=1,'unknown FRV wheel centre')
+            need((axle==1 and steered==0 and y>0) or (axle==2 and steered==1 and y<0),'unknown FRV axle layout')
+            local hash=y>0 and (x<0 and 'fed0a478' or 'f3cb00ad') or (x<0 and 'c6bf05a9' or 'f12186b7')
+            need(not seen[hash],'duplicate FRV wheel location');seen[hash]=true;map[i]=hash
+            values[i]=get_wheel(a,i);need(values[i],'wheel parameters unavailable')
+        end
+        return {h=a.h,map=map,values=values}
+    end
+    function R.damage_wheel(d,index,hash)
+        need(R.wheels and R.wheels.damage,'wheel damage transformation guard unavailable')
+        need(type(index)=='number' and index>=0 and index<=3 and index%1==0,'wheel index')
+        local before=R.tyre_snapshot(d)
+        need(before.map[index]==hash,'wheel location changed')
+        if before.values[index]:byte(0x29)==1 then return before.values[index],before.h end
+        local g=N.sample_graph();local vm=N.ptr(g:watch(R.wheels.vehicle_root,8),0)
+        local j,vd=g:component(vm,d.entity,0x40,0x58)
+        need(j~=nil and N.same(vd,d) and vd.flags%2==1,'vehicle damage owner changed')
+        g:roundtrip(g:root('network'),vd);g:validate()
+        local fresh=wheel_access(d);need(fresh.h==before.h,'wheel handle changed before damage')
+        R.invoke('damage',R.wheels.damage,pointer(vd.address),index)
+        local back=R.tyre_snapshot(d)
+        need(back.h==before.h and back.map[index]==hash and back.values[index]:byte(0x29)==1,'wheel damage readback failed')
+        return back.values[index],back.h
+    end
+    function R.restore_guard_wheel(d,index,hash,expected,intact,handle)
+        local current=R.tyre_snapshot(d)
+        need(current.h==handle and current.map[index]==hash,'guarded wheel identity changed')
+        if current.values[index]:byte(0x29)==0 then return true end
+        need(current.values[index]==expected,'guarded wheel parameters changed externally')
+        need(type(intact)=='string' and #intact==48 and intact:byte(0x29)==0,'intact wheel snapshot')
+        local a=wheel_access(d);need(a.h==handle,'wheel handle changed before restore')
+        local buffer=ffi.new('uint8_t[48]');ffi.copy(buffer,intact,48)
+        R.invoke('set',a.set,a.h,index,buffer)
+        return get_wheel(a,index)==intact
     end
     -- Health zone indices and VehicleApi wheel indices are different namespaces.
     -- Learn only unambiguous simultaneous damage, never infer an index from its name/order.

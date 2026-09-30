@@ -19,7 +19,9 @@ return function(N, W, R, C, log, ammo_components)
         ['0736bee2d6328726']={name='EXO-51 flamethrower',zone='aa1db0b0'},
         ['17c5d12d8d5dee2c']={name='EXO-51 AT cannon',zone='372f0418'},
         ['df51fe8d62f294be']={name='EXO-55 flak cannon',zone='372f0418'},
-    } -- Shield resource 65489809a8181b96 deliberately has no entry.
+        ['65489809a8181b96']={name='EXO-55 shield arm',zone='fd7c9885',shield=true,
+            zones={{hash='fd7c9885',max=-1},{hash='b0ef49f8',max=5000}}},
+    }
     local function key(d) return d.entity..':'..d.goid..':'..d.unit..':'..d.resource end
     local function need(v, s) if not v then error(s, 0) end end
     local function report(d, why)
@@ -34,21 +36,34 @@ return function(N, W, R, C, log, ammo_components)
         need(j ~= nil and N.same(hd,d) and hd.flags % 2 == 1, 'weapon Health owner/authority changed')
         local rec = N.ptr(g:watch(hm+0x1058,8),0)+j*0x1B8
         local data = g:read(rec,0x1B8)
+        g:watch(rec+0x19C,4)
         need(allow_dead or N.u32(data,0x19C)==0, 'already engine-dead; spawn a new mech')
         local cfg = F.config_address(g,net,hm,d)
         local mx = N.i32(g:watch(cfg,4),0)
         need(mx >= 20 and mx <= 1000000, 'invalid weapon maximum')
         local model = F.models[d.resource]
         need(model ~= nil, 'unsupported weapon resource')
-        local z = cfg+0x208
-        need(string.format('%08x',N.u32(g:watch(z+0x60,4),0)) == model.zone
-            and N.u32(g:watch(z+0x228+0x60,4),0)==0, 'weapon must have its known single damage zone')
-        local zm = N.i32(g:watch(z+0xE8,4),0)
-        if zm == -1 then zm = mx end
-        need(zm == mx and N.i32(g:watch(cfg+0x40+0xE8,4),0)==-1, 'weapon/default zone maximum changed')
-        -- Named weapon zones already have a separate pool in filediver's configs.
-        need(g:watch(z+0xF8,4)=='\0\0\0\0', 'unexpected weapon-to-main damage contribution')
-        for _, base in ipairs({cfg+0x40,z}) do
+        need(N.i32(g:watch(cfg+0x40+0xE8,4),0)==-1, 'default zone maximum changed')
+        local parts, bases = {}, {cfg+0x40}
+        for i, expected in ipairs(model.zones or {{hash=model.zone,max=mx}}) do
+            local z=cfg+0x208+(i-1)*0x228
+            need(string.format('%08x',N.u32(g:watch(z+0x60,4),0))==expected.hash,
+                'weapon damage zone identity changed')
+            local rawmax=N.i32(g:watch(z+0xE8,4),0)
+            local zm=rawmax==-1 and mx or rawmax
+            need(zm==(expected.max==-1 and mx or expected.max), 'weapon zone maximum changed')
+            local contribution=g:read(z+0xF8,4)
+            if model.shield and i==1 then
+                need(contribution=='\0\0\128\63' or contribution=='\0\0\0\0', 'unexpected shield-arm damage contribution')
+            else need(contribution=='\0\0\0\0', 'unexpected weapon-to-main damage contribution') end
+            local hp=N.i32(data,0xF8+(i-1)*4)
+            if i==1 then hp=math.min(hp,N.i32(data,0x14)) end
+            need(hp>-1000000 and hp<=zm, 'invalid effective weapon HP')
+            parts[#parts+1]={hash=expected.hash,mx=zm,hp=hp,index=i-1,rawmax=rawmax}
+            bases[#bases+1]=z
+        end
+        need(N.u32(g:watch(cfg+0x208+#parts*0x228+0x60,4),0)==0, 'unexpected additional weapon damage zone')
+        for _, base in ipairs(bases) do
             for o=0xF0,0xF4 do need(g:read(base+o,1):byte(1)<=1, 'invalid death flags') end
             need(N.i32(g:read(base+0xEC,4),0)==0 and g:read(base+0xF1,3)=='\0\0\0', 'unexpected constitution/death propagation')
         end
@@ -72,11 +87,10 @@ return function(N, W, R, C, log, ammo_components)
                 end
             end
         end
-        need(#slots > 0, 'no verified ammunition stores; protection not armed')
+        need(model.shield or #slots > 0, 'no verified ammunition stores; protection not armed')
         g:validate()
-        local hp = math.min(N.i32(data,0x14),N.i32(data,0xF8))
-        need(hp > -1000000 and hp <= mx, 'invalid effective weapon HP')
-        return {g=g,d=d,cfg=cfg,mx=mx,hp=hp,slots=slots,life=N.u32(data,0x19C),zone=model.zone}
+        return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=parts[1].hp,main_hp=N.i32(data,0x14),parts=parts,
+            slots=slots,life=N.u32(data,0x19C),zone=model.zone,model=model}
     end
     local function put(e, offset, value)
         local p, n = e.cfg+offset, #value
@@ -90,9 +104,15 @@ return function(N, W, R, C, log, ammo_components)
     end
     local function config_identity(e)
         local b = N.win.read(e.cfg,4)
-        local z = N.win.read(e.cfg+0x208+0x60,4)
-        if not b or not z then return nil end
-        return N.i32(b,0)==e.mx and string.format('%08x',N.u32(z,0))==e.zone
+        if not b then return nil end
+        if N.i32(b,0)~=e.mx then return false end
+        for i,part in ipairs(e.parts) do
+            local z=N.win.read(e.cfg+0x208+(i-1)*0x228+0x60,4)
+            local mx=N.win.read(e.cfg+0x208+(i-1)*0x228+0xE8,4)
+            if not z or not mx then return nil end
+            if string.format('%08x',N.u32(z,0))~=part.hash or N.i32(mx,0)~=part.rawmax then return false end
+        end
+        return true
     end
     local function close_config(e)
         local identity=config_identity(e)
@@ -113,20 +133,25 @@ return function(N, W, R, C, log, ammo_components)
     end
     local function arm_config(s)
         local e=F.configs[s.cfg]
-        if not e then e={cfg=s.cfg,mx=s.mx,zone=s.zone,orig={},wrote={},users=0}; F.configs[s.cfg]=e end
+        if not e then e={cfg=s.cfg,mx=s.mx,zone=s.zone,parts=s.parts,orig={},wrote={},users=0}; F.configs[s.cfg]=e end
         need(e.mx==s.mx and e.zone==s.zone and config_identity(e), 'protected config identity changed')
         e.users=e.users+1
         s.g:validate()
         -- Stop the named zone from killing its independent arm; Immortal lets the
         -- engine keep the zone alive. Default hits must not kill the separate main pool.
         local ready=true
-        for _, p in ipairs({{0x208+0xF4,'\0'}, {0x208+0xF0,'\1'},
-                            {0x40+0xF4,'\0'}, {0x40+0xF0,'\1'}, {0x40+0xF8,'\0\0\0\0'}}) do
+        local edits={{0x40+0xF4,'\0'}, {0x40+0xF0,'\1'}, {0x40+0xF8,'\0\0\0\0'}}
+        for i in ipairs(s.parts) do
+            local z=0x208+(i-1)*0x228
+            edits[#edits+1]={z+0xF4,'\0'}; edits[#edits+1]={z+0xF0,'\1'}
+            if s.model.shield and i==1 then edits[#edits+1]={z+0xF8,'\0\0\0\0'} end
+        end
+        for _, p in ipairs(edits) do
             if not put(e,p[1],p[2]) then ready=false end
         end
         if not ready then return false end
         if not e.logged then
-            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d parent_unit=%d/%08x chain=%s (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.parent.unit,s.parent.unit,s.chain)
+            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d parent_unit=%d/%08x chain=%s (Immortal; zones=%d)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.parent.unit,s.parent.unit,s.chain,#s.parts)
         end
         return true
     end
@@ -176,26 +201,41 @@ return function(N, W, R, C, log, ammo_components)
         local d=v.d
         local s=snapshot(d)
         local parent,why,chain=R.arm_parent(d,s.g); need(parent~=nil,why)
+        need(not s.model.shield or parent.resource=='35dbf54f016f3624', 'shield parent is not EXO-55')
         s.parent,s.chain=parent,chain
         local k=key(d)
         local st=F.states[k] or {d=d}; F.states[k]=st
-        st.seen=true; st.hp,st.mx=s.hp,s.mx
+        st.seen=true; st.hp,st.mx=s.hp,s.mx; st.parent=parent; st.parts=st.parts or {}
         local protected=arm_config(s)
         if not protected then report(d,'protection write incomplete; retrying') end
-        if s.hp<=1 and not st.broken then
-            st.broken=true; log('weapon failed %s ent=%d hp=%d/%d; disabled until >5%%',F.models[d.resource].name,d.entity,s.hp,s.mx)
+        st.own_broken=false
+        for i,part in ipairs(s.parts) do
+            local state=st.parts[i] or {}; st.parts[i]=state
+            state.hash,state.hp,state.mx=part.hash,part.hp,part.mx
+            if part.hp<=1 and not state.broken then
+                state.broken=true
+                log('weapon part failed %s ent=%d zone=%s hp=%d/%d; disabled until >5%%',s.model.name,d.entity,part.hash,part.hp,part.mx)
+            elseif state.broken and part.hp>part.mx*0.05 then state.broken=false end
+            st.own_broken=st.own_broken or state.broken==true
         end
-        if st.broken then
-            if s.hp>s.mx*0.05 then
-                if release_ammo(st,s) then
-                    st.broken=false
-                    log('weapon recovered %s ent=%d hp=%d/%d (>5%%); ammunition restored',F.models[d.resource].name,d.entity,s.hp,s.mx)
-                else report(d,'ammunition restore incomplete; retrying') end
-            elseif not hold_ammo(st,s) then report(d,'ammunition hold incomplete; retrying') end
-        end
-        if protected and s.hp<1 then
-            -- Use the engine repair to update its HP bookkeeping, at most one HP.
-            -- This is floor maintenance outside the shield, not background regeneration.
+        if protected and s.model.shield then
+            -- The shield's two pools have different maxima. A whole-arm heal
+            -- would also heal the other pool outside the bubble; only floor the
+            -- current, authoritative live component's depleted pool.
+            for _,part in ipairs(s.parts) do
+                if part.hp<1 then
+                    s.g:validate()
+                    local p=s.rec+0xF8+part.index*4
+                    local old=N.i32(N.win.read(p,4),0)
+                    if old<1 and not W.i32(p,old,1) then report(d,'shield floor write failed; retrying') end
+                end
+            end
+            if s.main_hp<1 then
+                s.g:validate()
+                local old=N.i32(N.win.read(s.rec+0x14,4),0)
+                if old<1 and not W.i32(s.rec+0x14,old,1) then report(d,'shield main floor write failed; retrying') end
+            end
+        elseif protected and s.hp<1 then
             local ok,why=R.heal(d,1/s.mx,true)
             if not ok then report(d,'floor maintenance: '..tostring(why)) end
             if ok then
@@ -203,17 +243,52 @@ return function(N, W, R, C, log, ammo_components)
                 if fresh.hp<1 then report(d,'engine floor readback still below 1 HP; inspect live behavior') end
             end
         end
+        return s,st
+    end
+    local function ammunition(s,st,blocked,why)
+        local d=s.d
+        if blocked and not st.broken then
+            st.broken=true; log('weapon failed %s ent=%d hp=%d/%d; disabled until >5%% (%s)',s.model.name,d.entity,s.hp,s.mx,why)
+        end
+        if st.broken then
+            if not blocked then
+                if release_ammo(st,s) then
+                    st.broken=false
+                    log('weapon recovered %s ent=%d hp=%d/%d (>5%%); ammunition restored',F.models[d.resource].name,d.entity,s.hp,s.mx)
+                else report(d,'ammunition restore incomplete; retrying') end
+            elseif not hold_ammo(st,s) then report(d,'ammunition hold incomplete; retrying') end
+        end
     end
     function F.step(vehicles)
         if not N.weapon_ready or not R.health or not R.attach then F.close(); return end
         N.win.begin_sample()
         for _, e in pairs(F.configs) do e.users=0 end
         for _, st in pairs(F.states) do st.seen=false end
+        local samples,shields={},{}
         for _, v in ipairs(vehicles) do
-            if F.models[v.d.resource] then
-                local ok,why=pcall(service,v)
-                if not ok then report(v.d,tostring(why)) end
+            local model=F.models[v.d.resource]
+            if model and ((model.shield and C.exo_shield_guard) or (not model.shield and C.exo_weapon_guard)
+                or (v.d.resource=='df51fe8d62f294be' and C.exo_shield_guard)) then
+                local ok,s,st=pcall(service,v)
+                if not ok then report(v.d,tostring(s))
+                else
+                    samples[#samples+1]={s=s,st=st}
+                    if model.shield then
+                        local k=key(s.parent); shields[k]=shields[k] or {}; shields[k][#shields[k]+1]=st
+                    end
+                end
             end
+        end
+        for _,sample in ipairs(samples) do
+            local s,st=sample.s,sample.st
+            local blocked,why=st.own_broken,'own damage zone'
+            if s.d.resource=='df51fe8d62f294be' and s.parent.resource=='35dbf54f016f3624' and C.exo_shield_guard then
+                local paired=shields[key(s.parent)]
+                if not paired or #paired~=1 then blocked=true; why='shield companion unavailable or ambiguous'
+                elseif paired[1].own_broken then blocked=true; why='shield arm or shield plate failed' end
+            end
+            local ok,err=pcall(ammunition,s,st,blocked,why)
+            if not ok then report(s.d,tostring(err)) end
         end
         for cfg,e in pairs(F.configs) do
             if e.users==0 and close_config(e) then F.configs[cfg]=nil end
@@ -257,9 +332,12 @@ return function(N, W, R, C, log, ammo_components)
     function F.status()
         local n,b=0,0
         for _, st in pairs(F.states) do n=n+1; if st.broken then b=b+1 end end
-        log('weapon guard: enabled=%s weapons=%d failed=%d; fail at 1 HP, recover strictly >5%%; shield excluded',tostring(C.exo_weapon_guard),n,b)
+        log('weapon guard: enabled=%s shield_guard=%s components=%d failed=%d; fail at 1 HP, recover strictly >5%%',tostring(C.exo_weapon_guard),tostring(C.exo_shield_guard),n,b)
         for _, st in pairs(F.states) do
             log('  weapon %s ent=%d hp=%s/%s failed=%s held_ammo=%s',F.models[st.d.resource].name,st.d.entity,tostring(st.hp),tostring(st.mx),tostring(st.broken==true),tostring(st.ammo~=nil))
+            if F.models[st.d.resource].shield then
+                for _,part in ipairs(st.parts or {}) do log('    shield part zone=%s hp=%d/%d failed=%s',part.hash,part.hp,part.mx,tostring(part.broken==true)) end
+            end
         end
     end
     return F
