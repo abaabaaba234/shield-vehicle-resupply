@@ -15,6 +15,11 @@ return function(N, log)
     local wheel_names = {'fed0a478', 'f3cb00ad', 'c6bf05a9', 'f12186b7'}
     local U32 = 4294967296
     local signatures = {
+        -- Reviewed input dispatcher and per-entity Weapon table on the captured build.
+        bash = {0x7406F0, '48 8B 46 40 48 8B 4E 58 45 8B F1 48 89 4C 24 58 4E 8B 2C F0 4F 8D 3C B6 48 8B 46 50 48 89 44 24 60 4C 89 6C 24 70 4C 89 7C 24 68 42 8B 04 F8 0F BA E0 0D'},
+        bash_table = {0x744AF7, '44 8B 49 30 45 33 C0 44 8B 59 38 41 8B D0 44 0F AF DB 45 8D 71 FF 45 85 C9 74 2E 48 8B 71 28 8B 69 34'},
+        bash_branch = {0x7407C0, 'A8 08 0F 84 1D 01 00 00 41 8B 5D 08 3B 1D ?? ?? ?? ?? 45 0F B6 3C 0E 4C 8B 35 ?? ?? ?? ??'},
+        bash_root = {0x74084C, '48 8B 0D ?? ?? ?? ?? 8B D3 E8 ?? ?? ?? ?? 84 C0 74 05'},
         heal = {0x4B9B50, '40 57 48 83 EC 20 48 8B 39 4C 8B 1D ?? ?? ?? ?? 8B 47 08 3B 05 ?? ?? ?? ?? 74 ?? 45 8B 93 ?? ?? ?? ?? 45 33 C0 48 89 5C 24 30 41 8B 9B ?? ?? ?? ?? 0F AF D8 4C 89 74 24 48 45 8D 72 FF 45 85 D2 74 ?? 48 89 6C 24 38 41 8B AB ?? ?? ?? ?? 48 89 74 24 40 49 8B B3 ?? ?? ?? ?? 66 0F 1F 44 00 00 41 8D 14 18 41 8B CE 48 23 D1 44 8B 0C D6 44 3B CD 74 ?? 44 3B C8 74 ?? 41 FF C0 45 3B C2 72 ?? 48 8B 74 24 40 48 8B 6C 24 38 48 8B 5C 24 30 4C 8B 74 24 48 0F 28 D1 8B D0 49 8B CB 48 83 C4 20 5F E9 ?? ?? ?? ??'},
         wheel = {0x11A8490, '48 89 5C 24 18 48 89 6C 24 20 57 48 81 EC C0 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 B0 00 00 00 8B 41 08 8B EA 3B 05 ?? ?? ?? ?? 48 8B 1D ?? ?? ?? ?? 75 ?? B8 FF FF FF FF EB ?? 44 8B 4B 48 33 D2 44 8B 53 50 44 0F AF D0'},
         stat = {0x9CCAE0, '40 55 3B 15 ?? ?? ?? ?? 4C 8B 15 ?? ?? ?? ?? 49 63 E8 75 ?? B8 FF FF FF FF EB ?? 45 8B 4A 28 33 C9 45 8B 5A 30 48 89 5C 24 10 48 89 74 24 18 44 0F AF DA 41 8D 71 FF 48 89 7C 24 20 45 85 C9 74 ?? 49 8B 5A 20 41 8B 7A 2C 0F 1F 80 00 00 00 00 8B C6 46 8D 04 19 4C 23 C0 42 8B 04 C3 3B C7 74 ?? 3B C2 74 ?? FF C1 41 3B C9 72 ?? B8 FF FF FF FF 48 8B 74 24 18 48 8B 5C 24 10 48 8B 7C 24 20 8B C8 49 8B 42 48 48 6B D1 0D 48 03 D5 F3 0F 11 1C 90 5D C3'},
@@ -130,6 +135,16 @@ return function(N, log)
             and rows and rows >= tbl + 24 and rows < 0x100 and rows % 8 == 0, 'attachable rows/stride')
         return {root = rel(p + 0x1A, 3, 7), tbl = tbl, rows = rows, stride = stride}
     end
+    local function resolve_bash()
+        for _, name in ipairs({'bash','bash_table','bash_branch','bash_root'}) do
+            need(matches(N.base+signatures[name][1],signatures[name][2]), 'shield bash '..name..' guard')
+        end
+        local p=N.base+signatures.bash_root[1]
+        local root=rel(p,3,7)
+        need(root==N.base+0x3326660 and rel(p+9,1,5)==N.base+0x744AD0,
+            'shield bash Weapon root/query differs')
+        return {root=root,tbl=0x28,owners=0x40,rows=0x50,stride=0x28,bit=8}
+    end
     function R.ensure(now)
         if not N.ready then return false end
         if R.base == N.base and now < R.next_check then return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil end
@@ -137,7 +152,7 @@ return function(N, log)
         N.win.begin_sample()
         local exe_ok, exe = pcall(resolve_exe)
         R.exe = exe_ok and exe or nil
-        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach}) do
+        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach, bash = resolve_bash}) do
             local ok, value = pcall(resolve)
             R[name] = ok and value or nil
             local status = ok and 'ok' or tostring(value)

@@ -14,9 +14,9 @@ Repair and resupply stop when the bubble goes away. The generator entity disappe
 
 `exo_weapon_guard=1` protects non-shield mech weapons before damage. Reaching 1 HP latches failure and saves/empties ammunition; repair must raise HP **strictly above 5%** to restore it. A weapon below 5% that has never reached 1 HP remains usable. Protection runs outside the bubble; ordinary repair still requires the bubble. The user reports that v0.19 retains all tested non-shield mech weapons; the EXO-49 [live test record](docs/v0.19实测记录.md) documents the HP and ammunition behavior. Its first fatal-damage sample briefly reached -1 HP before recovering to 1 HP, so this is not a strict per-frame clamp. See [weapon failure notes](docs/武器故障保护.md).
 
-**v0.20** adds default-enabled `frv_tire_guard=1` and `exo_shield_guard=1`. FRV tyres retain their models through prevention configuration and receive the native physical puncture transformation at 1 HP; recovery requires more than 5% (18 HP for a 350-HP tyre). Either the EXO-55 shield shoulder (800 HP) or plate (5000 HP) reaching the floor disables that mech's flak gun. Each latched pool must independently exceed 5% before attacks resume. Intact components must be discovered before fatal damage; detached models are not rebuilt. Offline tests pass; new model, movement and shield behavior still require in-game validation. See [tyre and shield notes](docs/轮胎与大盾保护.md).
+FRV tyres retain their models through prevention configuration and receive the native physical puncture transformation at 1 HP; recovery requires more than 5% (18 HP for a 350-HP tyre). Intact components must be discovered before fatal damage; detached models are not rebuilt. The user confirmed the full v0.21 tyre failure and repair cycle.
 
-The user confirmed front-left tyre model retention and punctured driving in v0.20, but shield repair left that tyre at 1 HP. **v0.21 fixes the repair trigger**: protected FRVs use game repair for non-full zones, rather than requiring nonpositive HP or destroyed bits. Game repair and config regeneration are mutually exclusive; partial policies retain selective wheel HP repair. Nine offline test scripts pass, including the full-hull/1-HP tyre reproduction. Actual v0.21 recovery and shield-pool behavior still need in-game confirmation.
+**v0.22** separates EXO-55 shield bash from flak ammunition. Either the shoulder (800 HP) or shield plate (5000 HP) reaching 1 HP clears only that shield entity's skill-input bit; each failed pool must exceed 5% to restore it. The flak cannon uses its own HP latch only. Offline regression passes; actual bash suppression and recovery still require in-game verification. See [tyre and shield notes](docs/轮胎与大盾保护.md) and [implementation notes](docs/v0.22独立盾击控制.md).
 
 v0.19 corrects attachment parsing using a read-only capture from a running mech. The Attachable parent field contains the mech's full Unit handle; previous versions treated it as an entity ID, so protection never armed. The full handle now matches a known mech with current network identity and living authoritative Health. Logs include `parent`, `parent_unit` and `chain`. Confirm `weapon guard armed` before testing fatal damage.
 
@@ -76,7 +76,7 @@ python tests/native_guard_test.py# refuses to write when the config header does 
 python tests/part_regen_test.py   # all 38 parts / individual selection / layout and restore guards
 python tests/exo_repair_test.py   # mech speed / upgraded arms / native attachment / death guards
 python tests/weapon_fault_test.py# real weapon configs / failure hysteresis / ammo escrow and retries
-python tests/shield_fault_test.py# real shield pools / paired-gun suppression / independent recovery
+python tests/shield_fault_test.py # real pools / independent bash and flak / identity / restore retries
 python tests/tyre_fault_test.py  # captured wheel centres / puncture dispatch / restore and generation guards
 ```
 

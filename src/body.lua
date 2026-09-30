@@ -38,7 +38,7 @@ local C = {
     part_repair    = true,   -- 调用游戏维修函数处理已毁部位；整车接口要求所有部位均未禁用
     exo_leg_fix    = true,   -- 机甲完全修好后恢复腿损坏留下的 0.75 移速倍率
     exo_weapon_guard = true, -- 非盾牌武器：1HP 故障锁存；修复严格超过 5% 后恢复使用
-    exo_shield_guard = true, -- 大盾机甲：手臂/盾面任一区到 1HP，禁用同机甲破片炮
+    exo_shield_guard = true, -- 大盾机甲：手臂/盾面任一区到 1HP，仅禁用盾击
     frv_tire_guard  = true,  -- 轮胎保留模型，1HP 后施加物理爆胎状态
     net_heal       = true,   -- 用引擎 set_game_object_field 给坦克/FRV 车体（HUD 显示的网络血量）回血（v0.8b 实测 FRV 可行）
     hull_zones     = true,   -- 坦克/FRV：被打爆部位的 HP 数值也回满（模型不变），车体血量才会回（v0.8 推断：车体 = 上限 - 各部位损失）
@@ -1945,5 +1945,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.21 (修正 1HP 轮胎的护盾维修触发；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.22 (盾臂双区故障独立控制盾击；破片炮按自身血量控制；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

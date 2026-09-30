@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply
--- Shield Vehicle Resupply v0.21
+-- Shield Vehicle Resupply v0.22
 -- Native read layer: DRIVER HUD 1.4.5 / HUD 1.11.1, Copyright (c) 2026 FireScallion, MIT License
 -- (see third_party/LICENSE-DRIVER-HUD.txt). Writes are added by this mod.
 local N=(function()
@@ -522,6 +522,11 @@ return function(N, log)
     local wheel_names = {'fed0a478', 'f3cb00ad', 'c6bf05a9', 'f12186b7'}
     local U32 = 4294967296
     local signatures = {
+        -- Reviewed input dispatcher and per-entity Weapon table on the captured build.
+        bash = {0x7406F0, '48 8B 46 40 48 8B 4E 58 45 8B F1 48 89 4C 24 58 4E 8B 2C F0 4F 8D 3C B6 48 8B 46 50 48 89 44 24 60 4C 89 6C 24 70 4C 89 7C 24 68 42 8B 04 F8 0F BA E0 0D'},
+        bash_table = {0x744AF7, '44 8B 49 30 45 33 C0 44 8B 59 38 41 8B D0 44 0F AF DB 45 8D 71 FF 45 85 C9 74 2E 48 8B 71 28 8B 69 34'},
+        bash_branch = {0x7407C0, 'A8 08 0F 84 1D 01 00 00 41 8B 5D 08 3B 1D ?? ?? ?? ?? 45 0F B6 3C 0E 4C 8B 35 ?? ?? ?? ??'},
+        bash_root = {0x74084C, '48 8B 0D ?? ?? ?? ?? 8B D3 E8 ?? ?? ?? ?? 84 C0 74 05'},
         heal = {0x4B9B50, '40 57 48 83 EC 20 48 8B 39 4C 8B 1D ?? ?? ?? ?? 8B 47 08 3B 05 ?? ?? ?? ?? 74 ?? 45 8B 93 ?? ?? ?? ?? 45 33 C0 48 89 5C 24 30 41 8B 9B ?? ?? ?? ?? 0F AF D8 4C 89 74 24 48 45 8D 72 FF 45 85 D2 74 ?? 48 89 6C 24 38 41 8B AB ?? ?? ?? ?? 48 89 74 24 40 49 8B B3 ?? ?? ?? ?? 66 0F 1F 44 00 00 41 8D 14 18 41 8B CE 48 23 D1 44 8B 0C D6 44 3B CD 74 ?? 44 3B C8 74 ?? 41 FF C0 45 3B C2 72 ?? 48 8B 74 24 40 48 8B 6C 24 38 48 8B 5C 24 30 4C 8B 74 24 48 0F 28 D1 8B D0 49 8B CB 48 83 C4 20 5F E9 ?? ?? ?? ??'},
         wheel = {0x11A8490, '48 89 5C 24 18 48 89 6C 24 20 57 48 81 EC C0 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 B0 00 00 00 8B 41 08 8B EA 3B 05 ?? ?? ?? ?? 48 8B 1D ?? ?? ?? ?? 75 ?? B8 FF FF FF FF EB ?? 44 8B 4B 48 33 D2 44 8B 53 50 44 0F AF D0'},
         stat = {0x9CCAE0, '40 55 3B 15 ?? ?? ?? ?? 4C 8B 15 ?? ?? ?? ?? 49 63 E8 75 ?? B8 FF FF FF FF EB ?? 45 8B 4A 28 33 C9 45 8B 5A 30 48 89 5C 24 10 48 89 74 24 18 44 0F AF DA 41 8D 71 FF 48 89 7C 24 20 45 85 C9 74 ?? 49 8B 5A 20 41 8B 7A 2C 0F 1F 80 00 00 00 00 8B C6 46 8D 04 19 4C 23 C0 42 8B 04 C3 3B C7 74 ?? 3B C2 74 ?? FF C1 41 3B C9 72 ?? B8 FF FF FF FF 48 8B 74 24 18 48 8B 5C 24 10 48 8B 7C 24 20 8B C8 49 8B 42 48 48 6B D1 0D 48 03 D5 F3 0F 11 1C 90 5D C3'},
@@ -637,6 +642,16 @@ return function(N, log)
             and rows and rows >= tbl + 24 and rows < 0x100 and rows % 8 == 0, 'attachable rows/stride')
         return {root = rel(p + 0x1A, 3, 7), tbl = tbl, rows = rows, stride = stride}
     end
+    local function resolve_bash()
+        for _, name in ipairs({'bash','bash_table','bash_branch','bash_root'}) do
+            need(matches(N.base+signatures[name][1],signatures[name][2]), 'shield bash '..name..' guard')
+        end
+        local p=N.base+signatures.bash_root[1]
+        local root=rel(p,3,7)
+        need(root==N.base+0x3326660 and rel(p+9,1,5)==N.base+0x744AD0,
+            'shield bash Weapon root/query differs')
+        return {root=root,tbl=0x28,owners=0x40,rows=0x50,stride=0x28,bit=8}
+    end
     function R.ensure(now)
         if not N.ready then return false end
         if R.base == N.base and now < R.next_check then return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil end
@@ -644,7 +659,7 @@ return function(N, log)
         N.win.begin_sample()
         local exe_ok, exe = pcall(resolve_exe)
         R.exe = exe_ok and exe or nil
-        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach}) do
+        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach, bash = resolve_bash}) do
             local ok, value = pcall(resolve)
             R[name] = ok and value or nil
             local status = ok and 'ok' or tostring(value)
@@ -983,10 +998,12 @@ end)()
 local WeaponFault=(function()
 -- Weapon failure is latched at 1 HP; only repair above 5% releases the latch.
 -- Protect known independent arm Health zones before damage. No executable patch.
--- Empty, saved ammunition stores suppress firing while failed; restoration is
+-- Guns escrow ammunition; EXO-55 shields clear only their skill-input bit.
+-- Restoration is
 -- tied to the original network/Health/weapon owners, never just an entity ID.
 return function(N, W, R, C, log, ammo_components)
     local ffi = require('ffi')
+    local bit = require('bit')
     local F = {states = {}, configs = {}, reports = {}}
     F.models = {
         ['08f6089289c83d22']={name='EXO-45 minigun',zone='372f0418'},
@@ -1053,8 +1070,21 @@ return function(N, W, R, C, log, ammo_components)
         local contribution=g:read(cfg+0x40+0xF8,4)
         local f=ffi.new('float[1]'); ffi.copy(f,contribution,4)
         need(f[0]==f[0] and f[0]>=0 and f[0]<=1, 'invalid default-to-main damage contribution')
+        local bash
+        if model.shield then
+            need(R.bash~=nil, R.bash_status or 'shield bash interface unavailable; protection not armed')
+            local b=R.bash
+            local m=N.ptr(g:watch(b.root,8),0)
+            local n,owner=g:component(m,d.entity,b.tbl,b.owners)
+            need(n~=nil and N.same(owner,d) and owner.flags%2==1, 'shield Weapon owner/authority changed')
+            local p=N.ptr(g:watch(m+b.rows,8),0)+n*b.stride
+            local flags=N.u32(g:read(p,4),0)
+            need(bit.band(flags,0x2800)==0x2800 and bit.band(flags,0x37)==0,
+                'shield Weapon kind flags changed')
+            bash={p=p,flags=flags}
+        end
         local slots = {}
-        for _, comp in ipairs(ammo_components) do
+        for _, comp in ipairs(model.shield and {} or ammo_components) do
             local m = N.ptr(g:watch(N.base+comp.root,8),0)
             if m ~= 0 then
                 local n, owner = g:component(m,d.entity,comp.to,comp.dp)
@@ -1073,7 +1103,7 @@ return function(N, W, R, C, log, ammo_components)
         need(model.shield or #slots > 0, 'no verified ammunition stores; protection not armed')
         g:validate()
         return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=parts[1].hp,main_hp=N.i32(data,0x14),parts=parts,
-            slots=slots,life=N.u32(data,0x19C),zone=model.zone,model=model}
+            slots=slots,bash=bash,life=N.u32(data,0x19C),zone=model.zone,model=model}
     end
     local function put(e, offset, value)
         local p, n = e.cfg+offset, #value
@@ -1188,6 +1218,7 @@ return function(N, W, R, C, log, ammo_components)
         s.parent,s.chain=parent,chain
         local k=key(d)
         local st=F.states[k] or {d=d}; F.states[k]=st
+        need(not st.bash_owned or N.same(parent,st.parent), 'shield parent changed while input bit held')
         st.seen=true; st.hp,st.mx=s.hp,s.mx; st.parent=parent; st.parts=st.parts or {}
         local protected=arm_config(s)
         if not protected then report(d,'protection write incomplete; retrying') end
@@ -1242,35 +1273,56 @@ return function(N, W, R, C, log, ammo_components)
             elseif not hold_ammo(st,s) then report(d,'ammunition hold incomplete; retrying') end
         end
     end
+    local function restore_bash(st,s)
+        if not st.bash_owned then return true end
+        need(s.bash~=nil, 'shield bash snapshot unavailable')
+        local parent,why=R.arm_parent(s.d,s.g)
+        need(parent and N.same(parent,st.parent), why or 'shield parent changed before input restore')
+        s.g:validate()
+        local flags=s.bash.flags
+        if bit.band(flags,8)==0 and not W.u32(s.bash.p,flags,flags+8) then return false end
+        st.bash_owned=nil
+        return true
+    end
+    local function shield_input(s,st)
+        if st.own_broken then
+            st.broken=true
+            s.g:validate()
+            if bit.band(s.bash.flags,8)~=0 then
+                if W.u32(s.bash.p,s.bash.flags,s.bash.flags-8) then
+                    if st.bash_owned then
+                        st.bash_rewrites=(st.bash_rewrites or 0)+1
+                        if st.bash_rewrites==1 then log('shield bash bit rewritten by engine ent=%d; reapplied',s.d.entity) end
+                    else log('shield bash disabled ent=%d: shield pool failed; flak ammunition independent',s.d.entity) end
+                    st.bash_owned=true
+                else report(s.d,'shield bash disable write failed; retrying') end
+            end
+        elseif restore_bash(st,s) then
+            if st.broken then log('shield bash recovered ent=%d: all failed pools strictly >5%%',s.d.entity) end
+            st.broken=false
+        else report(s.d,'shield bash restore write failed; retrying') end
+    end
     function F.step(vehicles)
         if not N.weapon_ready or not R.health or not R.attach then F.close(); return end
         N.win.begin_sample()
         for _, e in pairs(F.configs) do e.users=0 end
         for _, st in pairs(F.states) do st.seen=false end
-        local samples,shields={},{}
+        local samples={}
         for _, v in ipairs(vehicles) do
             local model=F.models[v.d.resource]
-            if model and ((model.shield and C.exo_shield_guard) or (not model.shield and C.exo_weapon_guard)
-                or (v.d.resource=='df51fe8d62f294be' and C.exo_shield_guard)) then
+            if model and ((model.shield and C.exo_shield_guard) or (not model.shield and C.exo_weapon_guard)) then
                 local ok,s,st=pcall(service,v)
                 if not ok then report(v.d,tostring(s))
                 else
                     samples[#samples+1]={s=s,st=st}
-                    if model.shield then
-                        local k=key(s.parent); shields[k]=shields[k] or {}; shields[k][#shields[k]+1]=st
-                    end
                 end
             end
         end
         for _,sample in ipairs(samples) do
             local s,st=sample.s,sample.st
-            local blocked,why=st.own_broken,'own damage zone'
-            if s.d.resource=='df51fe8d62f294be' and s.parent.resource=='35dbf54f016f3624' and C.exo_shield_guard then
-                local paired=shields[key(s.parent)]
-                if not paired or #paired~=1 then blocked=true; why='shield companion unavailable or ambiguous'
-                elseif paired[1].own_broken then blocked=true; why='shield arm or shield plate failed' end
-            end
-            local ok,err=pcall(ammunition,s,st,blocked,why)
+            local ok,err
+            if s.model.shield then ok,err=pcall(shield_input,s,st)
+            else ok,err=pcall(ammunition,s,st,st.own_broken,'own damage zone') end
             if not ok then report(s.d,tostring(err)) end
         end
         for cfg,e in pairs(F.configs) do
@@ -1279,7 +1331,10 @@ return function(N, W, R, C, log, ammo_components)
         for k,st in pairs(F.states) do
             if not st.seen then
                 local ok,s=pcall(snapshot,st.d,true)
-                if ok and release_ammo(st,s) then F.states[k]=nil end
+                if ok then
+                    local restored,done=pcall(function() return release_ammo(st,s) and restore_bash(st,s) end)
+                    if restored and done then F.states[k]=nil end
+                end
                 if not ok then
                     local gone,missing=pcall(function()
                         local g=N.sample_graph()
@@ -1299,9 +1354,9 @@ return function(N, W, R, C, log, ammo_components)
         if not N.ready then return end
         if N.weapon_ready then
             for _, st in pairs(F.states) do
-                if st.ammo then
+                if st.ammo or st.bash_owned then
                     local ok,s=pcall(snapshot,st.d,true)
-                    if ok then release_ammo(st,s) end
+                    if ok then pcall(function() release_ammo(st,s); restore_bash(st,s) end) end
                 end
             end
         end
@@ -1309,7 +1364,9 @@ return function(N, W, R, C, log, ammo_components)
     end
     function F.reset()
         F.close()
-        F.states,F.reports={},{}
+        local pending={}
+        for k,st in pairs(F.states) do if st.bash_owned then pending[k]=st end end
+        F.states,F.reports=pending,{}
         -- Failed config restores remain tracked for retry; never silently abandon them.
     end
     function F.status()
@@ -1317,7 +1374,7 @@ return function(N, W, R, C, log, ammo_components)
         for _, st in pairs(F.states) do n=n+1; if st.broken then b=b+1 end end
         log('weapon guard: enabled=%s shield_guard=%s components=%d failed=%d; fail at 1 HP, recover strictly >5%%',tostring(C.exo_weapon_guard),tostring(C.exo_shield_guard),n,b)
         for _, st in pairs(F.states) do
-            log('  weapon %s ent=%d hp=%s/%s failed=%s held_ammo=%s',F.models[st.d.resource].name,st.d.entity,tostring(st.hp),tostring(st.mx),tostring(st.broken==true),tostring(st.ammo~=nil))
+            log('  weapon %s ent=%d hp=%s/%s failed=%s held_ammo=%s bash_owned=%s bit_rewrites=%d',F.models[st.d.resource].name,st.d.entity,tostring(st.hp),tostring(st.mx),tostring(st.broken==true),tostring(st.ammo~=nil),tostring(st.bash_owned==true),st.bash_rewrites or 0)
             if F.models[st.d.resource].shield then
                 for _,part in ipairs(st.parts or {}) do log('    shield part zone=%s hp=%d/%d failed=%s',part.hash,part.hp,part.mx,tostring(part.broken==true)) end
             end
@@ -1538,7 +1595,7 @@ local C = {
     part_repair    = true,   -- 调用游戏维修函数处理已毁部位；整车接口要求所有部位均未禁用
     exo_leg_fix    = true,   -- 机甲完全修好后恢复腿损坏留下的 0.75 移速倍率
     exo_weapon_guard = true, -- 非盾牌武器：1HP 故障锁存；修复严格超过 5% 后恢复使用
-    exo_shield_guard = true, -- 大盾机甲：手臂/盾面任一区到 1HP，禁用同机甲破片炮
+    exo_shield_guard = true, -- 大盾机甲：手臂/盾面任一区到 1HP，仅禁用盾击
     frv_tire_guard  = true,  -- 轮胎保留模型，1HP 后施加物理爆胎状态
     net_heal       = true,   -- 用引擎 set_game_object_field 给坦克/FRV 车体（HUD 显示的网络血量）回血（v0.8b 实测 FRV 可行）
     hull_zones     = true,   -- 坦克/FRV：被打爆部位的 HP 数值也回满（模型不变），车体血量才会回（v0.8 推断：车体 = 上限 - 各部位损失）
@@ -3445,5 +3502,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.21 (修正 1HP 轮胎的护盾维修触发；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.22 (盾臂双区故障独立控制盾击；破片炮按自身血量控制；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }
