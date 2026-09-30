@@ -37,6 +37,7 @@ local C = {
     wheel_interval = 2.0,    -- 每辆 FRV 至多每隔这些秒修一个轮胎
     part_repair    = true,   -- 调用游戏维修函数处理已毁部位；整车接口要求所有部位均未禁用
     exo_leg_fix    = true,   -- 机甲完全修好后恢复腿损坏留下的 0.75 移速倍率
+    exo_weapon_guard = true, -- 非盾牌武器：1HP 故障锁存；修复严格超过 5% 后恢复使用
     net_heal       = true,   -- 用引擎 set_game_object_field 给坦克/FRV 车体（HUD 显示的网络血量）回血（v0.8b 实测 FRV 可行）
     hull_zones     = true,   -- 坦克/FRV：被打爆部位的 HP 数值也回满（模型不变），车体血量才会回（v0.8 推断：车体 = 上限 - 各部位损失）
     authority_only = true,   -- 只改本机有权威的组件（descriptor flags bit0）
@@ -158,7 +159,7 @@ local function read_settings()
         if f then
             f:write('# Shield Vehicle Resupply 设置。改完在 shield_resupply_cmd.txt 写 reload\n',
                 '# shield=<16位hex> 可写多行；weapon=<hex> 同理；ammo_max=<hex>:<字段>=<数值>\n',
-                'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=1\nwheel_interval=2\npart_repair=1\nexo_leg_fix=1\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
+                'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=1\nwheel_interval=2\npart_repair=1\nexo_leg_fix=1\nexo_weapon_guard=1\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
                 'ammo_rate=0.10\ncooldown=2\nauthority_only=1\nheal=native\nnative_zone=0x141\npart_regen=1\nnative_segments=1\nnative_force=1\n',
                 '# part=<16位资源hash>:<8位部位hash>=0|1，可写多行；parts 命令列出这些 hash\n')
             f:close()
@@ -197,6 +198,7 @@ local function read_settings()
     log('settings: radius=%.1f heal=%s native_zone=%s test=%s revive=%s hull_zones=%s tires=%s ammo=%s shields=%d',
         C.radius, C.heal, C.native_zone > 0 and string.format('+%x', C.native_zone) or 'off', tostring(C.test), tostring(C.revive), tostring(C.hull_zones), tostring(C.tires), tostring(C.ammo), n)
     log('settings: part_repair=%s exo_leg_fix=%s', tostring(C.part_repair), tostring(C.exo_leg_fix))
+    log('settings: exo_weapon_guard=%s (non-shield weapons; fail at 1 HP, recover >5%%)',tostring(C.exo_weapon_guard))
 end
 local function load_settings() read_settings(); rebuild_res() end
 
@@ -317,6 +319,7 @@ do
 end
 
 local TEST_HOOK = rawget(_G, '__SVR_TEST')  -- 仅离线测试用
+local FAULT = WeaponFault(N, W, REPAIR, C, log, WEAPON_COMPONENTS)
 
 -- ---------------------------------------------------------------------------
 -- 状态
@@ -337,6 +340,8 @@ local function reset_context()
     S.hptrace = nil
     S.wheel_trace, S.next_wheel_learn = nil, 0
     S.mech_trace = nil
+    FAULT.reset()
+    S.next_fault=0
     REPAIR.reset()
 end
 
@@ -802,6 +807,7 @@ local function config_address(g, net, hm, d)
     end
     error('no Health configuration', 0)
 end
+FAULT.config_address = config_address
 
 
 -- ---------------------------------------------------------------------------
@@ -1339,6 +1345,7 @@ end
 
 local function refill(w, dt, observe_only)
     local d, comp = w.d, w.comp
+    if not observe_only and C.exo_weapon_guard and FAULT.blocked(d) then return 'weapon_failed' end
     if C.authority_only and d.flags % 2 ~= 1 then return 'no_authority' end
     local g = N.sample_graph()
     local net = g:root('network')
@@ -1698,6 +1705,7 @@ local function cmd_status()
     log('status: part_repair=%s exo_leg_fix=%s legs_fixed=%d health_guard=%s stat_guard=%s attach_guard=%s',
         tostring(C.part_repair), tostring(C.exo_leg_fix), REPAIR.legs_fixed,
         tostring(REPAIR.health_status), tostring(REPAIR.stats_status), tostring(REPAIR.attach_status))
+    FAULT.status()
     for _, d in ipairs(S.shields) do log('  shield %s ent=%d goid=%d at %s', d.resource, d.entity, d.goid, fmtpos(position_of(d))) end
 end
 
@@ -1712,7 +1720,7 @@ local function poll_commands()
         if c == 'units' then cmd_units()
         elseif c == 'vehicles' then cmd_vehicles()
         elseif c == 'parts' then cmd_parts()
-        elseif c == 'weapons' then cmd_weapons()
+        elseif c == 'weapons' then cmd_weapons(); FAULT.status()
         elseif c == 'status' then cmd_status()
         elseif c == 'probe' then cmd_probe()
         elseif c == 'healcfg' then cmd_healcfg()
@@ -1729,9 +1737,9 @@ local function poll_commands()
         elseif c == 'netinfo' then cmd_netinfo()
         elseif c == 'netset' then cmd_netset()
         elseif c == 'recent' then cmd_recent(tonumber(line:match('recent%s+(%d+)')) or 40)
-        elseif c == 'reload' then native_close_all('reload'); load_settings()
+        elseif c == 'reload' then native_close_all('reload'); FAULT.close(); load_settings()
         elseif c == 'on' then C.enabled = true; log('enabled')
-        elseif c == 'off' then C.enabled = false; native_close_all('mod off'); log('disabled')
+        elseif c == 'off' then C.enabled = false; native_close_all('mod off'); FAULT.close(); log('disabled')
         elseif c == 'test' then C.test = not C.test; log('test mode = %s', tostring(C.test))
         elseif c then log('unknown command: %s (units|recent [n]|vehicles|parts|weapons|status|probe|healcfg|hptrace [secs]|heal native|write|off|reload|on|off|test)', c) end
     end
@@ -1757,7 +1765,7 @@ local function tick(dt)
         return
     end
     stage('native layout ok')
-    if C.enabled and (C.tires or C.part_repair or C.exo_leg_fix) then REPAIR.ensure(S.clock) end
+    if C.enabled and (C.tires or C.part_repair or C.exo_leg_fix or C.exo_weapon_guard) then REPAIR.ensure(S.clock) end
     if N.weapon_base ~= N.base then
         N.weapon_base = N.base
         N.win.begin_sample()
@@ -1841,13 +1849,21 @@ local function tick(dt)
             w.i = w.i + 1; if w.i > #w.marks then S.watch = nil end
         end
     end
-    if not C.enabled then native_close_all('mod off'); return end
+    if not C.enabled then native_close_all('mod off'); FAULT.close(); return end
+    -- Prevention and failure latch also run outside the shield. Always sample
+    -- before a repair pass, so healing cannot conceal a just-reached 1 HP state.
+    if C.exo_weapon_guard then
+        if S.clock >= (S.next_fault or 0) or S.acc+dt >= C.tick then
+            S.next_fault=S.clock+0.05
+            FAULT.step(S.vehicles)
+        end
+    else FAULT.close() end
     S.acc = S.acc + dt
     if S.acc < C.tick then return end
     local step = math.min(S.acc, 1); S.acc = 0
 
     stage('first service pass')
-    if #S.shields == 0 and not C.test then  -- 没有护盾：什么都不做（不取坐标、不读内存），配置里的回血开关也写回原值
+    if #S.shields == 0 and not C.test then  -- 没有护盾：停止常规维修；上方的武器保底和故障检测继续运行
         native_close_all('没有护盾')
         return
     end
@@ -1901,7 +1917,7 @@ local function tick(dt)
 end
 
 load_settings()
-if TEST_HOOK then TEST_HOOK(N, W, S, C, REPAIR) end
+if TEST_HOOK then TEST_HOOK(N, W, S, C, REPAIR, FAULT) end
 local previous = rawget(_G, 'update')
 rawset(_G, 'update', function(dt, ...)
     if type(dt) == 'number' and dt > 0 and dt < 1 then
@@ -1913,5 +1929,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.16 (机甲腿部移速与独立手臂维修；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.17 (非盾牌机甲武器故障保护；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

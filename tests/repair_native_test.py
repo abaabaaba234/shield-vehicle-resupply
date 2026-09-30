@@ -18,14 +18,14 @@ Q = lambda n: struct.pack('<Q', n)
 U = lambda n: struct.pack('<I', n)
 I = lambda n: struct.pack('<i', n)
 SETUP = (ROOT / 'tests/svr_test.py').read_text(encoding='utf-8').split("L.execute(b'for i=1,40", 1)[0]
-SETUP = SETUP.replace('__SVR_TEST=function(N,W,S,C)', '__SVR_TEST=function(N,W,S,C,R)')
+SETUP = SETUP.replace('__SVR_TEST=function(N,W,S,C)', '__SVR_TEST=function(N,W,S,C,R,F)')
 SETUP = SETUP.replace('_G.SVR={N=N,W=W,S=S,C=C}', '''
-  C.heal='native'; C.part_repair=false; C.tires=false
+  C.heal='native'; C.part_repair=false; C.tires=false; C.exo_weapon_guard=false
   W.raw=function(p,n,o,v) if N.win.read(p,n)~=o then return false end; pywrite(p,v); return true end
   W.raw4=function(p,o,v) return W.raw(p,4,o,v) end
   W.raw1=function(p,o,v) return W.raw(p,1,o,v) end
   W.prot=function() return 4 end
-  _G.SVR={N=N,W=W,S=S,C=C,R=R}
+  _G.SVR={N=N,W=W,S=S,C=C,R=R,F=F}
 ''')
 
 

@@ -12,6 +12,8 @@ This is a Helldivers 2 Lua mod. While an **FX-12 Shield Generator** bubble is up
 
 Repair and resupply stop when the bubble goes away. The generator entity disappears at that point, about 42 s in-game.
 
+v0.17 adds `exo_weapon_guard=1` for non-shield mech weapons. Prevention configuration is armed before damage; reaching 1 HP latches failure and saves/empties ammunition. Repair must raise HP **strictly above 5%** to restore ammunition. A weapon below 5% that has never reached 1 HP remains usable. Protection runs outside the bubble too; ordinary repair still requires the bubble. Shield arms are excluded and failed models are not hidden. **The exact engine HP floor, prevention of detachment, and suppression of ongoing fire need in-game verification.** See [weapon failure notes](docs/武器故障保护.md) (Chinese).
+
 ## Install
 1. Install [Bingus Shared Loader v17](https://www.nexusmods.com/helldivers2/mods/16292).
 2. Download `ShieldVehicleResupply_<version>.zip` from [Releases](../../releases) and import it with your mod manager.
@@ -42,7 +44,7 @@ Use `parts` to list resource/zone hashes. Independently choose a part with `part
   - v0.15 enables each selected damage zone's own regeneration using the corrected +0x141 flag, including zones with nonpositive HP. Original flags are restored on exit, off, and reload; failed restores are retained for retries. The separate game repair and tyre interfaces are described below; real engine/model behavior remains unverified.
   - The old HP-write fallback and ammo components use in-process `WriteProcessMemory` on `PAGE_READWRITE` pages, with compare-before-write and readback checks.
   - Tank/FRV hull HP is written with `GameSession.set_game_object_field`, and only for objects this machine owns.
-- While no shield is up, the mod only runs a light scan every 3 s and restores the config values.
+- Without a shield, the entity roster refreshes every 3 s and continuous regeneration settings are restored. When `exo_weapon_guard` is enabled, known weapons are checked about every 0.05 s. Engine repair may maintain a 1 HP floor outside the bubble; there is no continuous weapon regeneration there.
 
 ## Healing details and limits
 The game subtracts damage from its own saved copy of the HP, not from the value this mod writes. v0.12 hunted for
@@ -67,6 +69,7 @@ python tests/native_heal_test.py # native regen: enable config / no HP write / r
 python tests/native_guard_test.py# refuses to write when the config header does not look right
 python tests/part_regen_test.py   # all 38 parts / individual selection / layout and restore guards
 python tests/exo_repair_test.py   # mech speed / upgraded arms / native attachment / death guards
+python tests/weapon_fault_test.py# real weapon configs / failure hysteresis / ammo escrow and retries
 ```
 
 ## License

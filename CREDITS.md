@@ -19,6 +19,11 @@
     v0.14 incorrectly derived the offset from an incomplete hand-written Go structure.
     Its `OnHealScriptEvent` and `OnDeadDisableAllActors` fields are exposed as diagnostics; their presence
     is not treated as proof that detached models or physics actors can be restored.
+  - v0.17 uses the same binary type metadata and public arm Health records to identify
+    separate weapon HP pools, `Immortal`, `CausesDeathOnDeath` and `AffectsMainHealth`.
+    [health_component.go](https://github.com/xypwn/filediver/blob/master/datalibrary/health_component.go)
+    documents the immortal-zone behavior. Exact live engine clamping, damage routing
+    and ongoing-fire suppression are not established by these data definitions.
 - Helldivers 2 and its assets, names and identifiers belong to their respective owners. This project is not affiliated with or endorsed by Arrowhead, Sony, or the upstream authors.
 
 - **Vehicle Supply Tower 1.0.1**, user-provided local reference (`mods/codex/vehicle_supply_tower`): its Lua implementation identifies the repair-drone wrapper, game repair ABI, VehicleApi getter/setter slots, four-wheel resource header and 48-byte intact tyre restoration. v0.16 also uses its guarded StatModifier locator/13-float stride, 0.75 leg-speed recovery, Attachable parent layout and upgraded arm resource identifiers. `src/repair_native.lua` implements these interfaces for the existing shield service, with its own ownership, configuration, selection, mapping and readback logic. The full supply-tower addon is not redistributed; its Tesla and ammo engine calls are not included. The reference has no detached-arm respawn/reattachment implementation.

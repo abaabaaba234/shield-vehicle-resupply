@@ -6,7 +6,7 @@
 """
 import os, subprocess, sys
 
-VERSION = 'v0.16'
+VERSION = 'v0.17'
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src = os.path.join(root, 'src')
 dist = os.path.join(root, 'dist')
@@ -27,6 +27,9 @@ out = '\n'.join([
     'end',
     'local RepairNative=(function()',
     read('repair_native.lua'),
+    'end)()',
+    'local WeaponFault=(function()',
+    read('weapon_fault.lua'),
     'end)()',
     read('body.lua'),
 ])

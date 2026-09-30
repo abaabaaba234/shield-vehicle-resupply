@@ -12,6 +12,8 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
 
 罩子消失（发生器实体消失，实测约 42 秒），回复就停止。
 
+v0.17 新增非盾牌机甲武器故障保护：提前设置部位免死配置，武器到 1 HP 时暂存并清空弹药；修复到**严格超过 5%** 才归还弹药。正常受伤低于 5%、但尚未到 1 HP 时仍可使用。保护与故障检测在罩外也运行，持续维修仍需要护盾。盾牌臂不参与，暂未隐藏故障武器模型。**免死配置能否在当前游戏保持 1 HP 并阻止脱落、清空弹药能否停止持续射击，仍需实测。** 见 [武器故障保护](docs/武器故障保护.md)。
+
 ## 安装
 1. 先装 [Bingus Shared Loader v17](https://www.nexusmods.com/helldivers2/mods/16292)。
 2. 从 [Releases](../../releases) 下载 `ShieldVehicleResupply_<版本号>.zip`，用 mod 管理器导入。
@@ -43,6 +45,7 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
 | `authority_only` | 1 | 只改本机有权威的组件（游戏自带回血也只给这类载具打开） |
 | `part_repair` | 1 | 游戏维修函数处理已毁部位；任何部位禁用时跳过整车调用 |
 | `exo_leg_fix` | 1 | 机甲全部部位修满后，将腿损坏留下的 0.75 移速倍率恢复为 1 |
+| `exo_weapon_guard` | 1 | 非盾牌机甲武器免死与故障保护：1 HP 时清空弹药，修复超过 5% 后归还；罩外也运行，当前游戏效果待实测 |
 | `tires` / `wheel_interval` | 1 / 2 | VehicleApi 恢复爆胎参数，每车每两秒最多一个；不重建外观，需先学习完好轮胎 |
 | `revive` | 0 | 旧的数值与损坏位回填（实验） |
 | `test` | 0 | 测试模式：忽略护盾，所有载具都回复 |
@@ -54,7 +57,7 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
 
 | 命令 | 作用 |
 |---|---|
-| `status` | 状态、写入次数和失败次数 |
+| `status` | 状态、写入次数、失败次数及武器故障/暂存弹药状态 |
 | `on` / `off` / `reload` | 开 / 关 / 重新读取设置 |
 | `test` | 切换测试模式（在单人私人任务里用） |
 | `vehicles` / `weapons` | 列出载具血量 / 已关联的武器弹药 |
@@ -77,7 +80,7 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
   - **部位再生（v0.15 修正）**：逐部位打开 `RegenerationEnabled`，支持独立选择全部 38 个部位。已经开启原生再生的部位不再直接回填 HP 或清损坏位，保留游戏处理回血事件的机会。离开罩子、`off`、`reload` 时按原地址恢复原值；写回失败会保留记录并重试。
   - 旧的部位回填路径 / 弹药组件：在进程内调用 `WriteProcessMemory`。只写 `PAGE_READWRITE` 页，写前比对旧值，写后读回确认。
   - 坦克/FRV 车体血量：通过 `GameSession.set_game_object_field` 写，只在本机拥有该对象时写。
-- 没有护盾时，mod 每 3 秒只做一次轻量扫描，并且会把配置里的回血开关写回原值。
+- 没有护盾时，mod 每 3 秒更新实体列表，并把持续回血开关写回原值。开启 `exo_weapon_guard` 后，已发现的武器约每 0.05 秒检查一次；1 HP 保底维护例外地使用游戏维修函数，不在罩外持续回血。
 
 ## 回血原理（v0.13：不再扫内存）
 游戏扣血时用的是它自己另存的一份血量，而不是 mod 改过的那份。v0.12 的解决办法是每辆载具第一次回血时
@@ -106,11 +109,13 @@ python tests/native_heal_test.py # 游戏自带回血：打开配置 / 不写主
 python tests/native_guard_test.py# 配置头不对时拒绝写入
 python tests/part_regen_test.py   # 38 个部位 / 独立开关 / 异常布局 / 恢复与重试
 python tests/exo_repair_test.py   # 机甲腿部移速 / 升级手臂 / 原生挂接链 / 死亡与写入检查
+python tests/weapon_fault_test.py # 真实武器配置 / 1 HP 与 5% 状态 / 弹药暂存、归还、写失败重试
 ```
 
 ## 目录
 ```
 src/body.lua            本 mod 的逻辑
+src/weapon_fault.lua    非盾牌机甲武器故障、免死配置与弹药暂存
 src/vendor/             来自 DRIVER HUD / HUD 的读取层（MIT，FireScallion）
 tools/build.py          拼接成单文件 addon 并打包
 tools/pack_patch.py     生成 Bingus 可识别的 patch + mod 管理器 zip

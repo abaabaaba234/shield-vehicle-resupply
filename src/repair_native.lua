@@ -213,9 +213,9 @@ return function(N, log)
         R.invoke('heal', R.health.fn, pointer(hm), d.entity, fraction)
         return true
     end
-    function R.arm_parent(d)
+    function R.arm_parent(d, graph)
         need(R.arm_types[d.resource], 'unsupported arm resource')
-        local g = owner_graph(d)
+        local g = graph or owner_graph(d)
         local pd, why = mounted_parent(g, d)
         g:validate()
         return pd, why
