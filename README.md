@@ -42,6 +42,7 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
 | `hull_zones` | 1 | 坦克/FRV 被打爆部位的 HP 数值也回满（外观不恢复） |
 | `authority_only` | 1 | 只改本机有权威的组件（游戏自带回血也只给这类载具打开） |
 | `part_repair` | 1 | 游戏维修函数处理已毁部位；任何部位禁用时跳过整车调用 |
+| `exo_leg_fix` | 1 | 机甲全部部位修满后，将腿损坏留下的 0.75 移速倍率恢复为 1 |
 | `tires` / `wheel_interval` | 1 / 2 | VehicleApi 恢复爆胎参数，每车每两秒最多一个；不重建外观，需先学习完好轮胎 |
 | `revive` | 0 | 旧的数值与损坏位回填（实验） |
 | `test` | 0 | 测试模式：忽略护盾，所有载具都回复 |
@@ -88,6 +89,7 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
 - v0.15 根据 filediver 二进制类型表修正 `RegenerationEnabled=+0x141`，并逐部位检查邻近字段。**这不是当前游戏中的模型恢复验证**；已掉落的门、手臂和被禁用的物理部件能否恢复，需要进游戏观察。
 - 老设置文件如果含 `native_zone=0`，升级后仍会使用旧路径。测试新功能时改为 `native_zone=0x141`、`part_regen=1`、`heal=native`，发 `reload`。
 - 实现和实测步骤见 [docs/部位再生.md](docs/部位再生.md)。
+- **v0.16 机甲维修**：机体及独立手臂优先用游戏维修函数修到满血，避免和配置再生叠加；新增升级版手臂识别、腿部移速恢复，以及仍挂接且未被游戏标记死亡的零血量手臂维修。已死亡/脱落/移除手臂的重建尚未实现，游戏内效果待实测。见 [机甲部位修复.md](docs/机甲部位修复.md)。
 - 原理、字段表、限制和验证方法见 [docs/回血原理.md](docs/回血原理.md)。
 
 ## 风险提示
@@ -103,6 +105,7 @@ python tests/svr_test.py         # heal=write 兜底路径（LuaJIT + 模拟内�
 python tests/native_heal_test.py # 游戏自带回血：打开配置 / 不写主血量 / 离开后写回原值
 python tests/native_guard_test.py# 配置头不对时拒绝写入
 python tests/part_regen_test.py   # 38 个部位 / 独立开关 / 异常布局 / 恢复与重试
+python tests/exo_repair_test.py   # 机甲腿部移速 / 升级手臂 / 原生挂接链 / 死亡与写入检查
 ```
 
 ## 目录

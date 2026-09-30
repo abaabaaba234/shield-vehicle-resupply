@@ -66,9 +66,12 @@ python tests/svr_test.py         # offline test, heal=write fallback (LuaJIT + m
 python tests/native_heal_test.py # native regen: enable config / no HP write / restore on exit
 python tests/native_guard_test.py# refuses to write when the config header does not look right
 python tests/part_regen_test.py   # all 38 parts / individual selection / layout and restore guards
+python tests/exo_repair_test.py   # mech speed / upgraded arms / native attachment / death guards
 ```
 
 ## License
 MIT, see [LICENSE](LICENSE). The native reader in `src/vendor/` is by FireScallion (MIT). See [CREDITS.md](CREDITS.md).
 
 In v0.15, `part_repair=1` calls the game repair routine for destroyed zones of a living vehicle; it is skipped if any zone is disabled because the routine affects the whole unit. `tires=1` restores FRV tyre parameters through VehicleApi, at most one tyre per vehicle every `wheel_interval=2` seconds. Intact samples are learned by vehicle type and API index, including outside the shield. Spawn an intact FRV of the same type if the necessary sample is missing. Tyre visuals are not rebuilt. Selective tyres require API/Health index mappings learned from isolated damage; ambiguous mappings are skipped. Restart the game after replacing the package. Offline tests do not establish real game/physics behavior. See [repair notes](docs/部位修复与爆胎.md).
+
+v0.16 adds `exo_leg_fix=1`: after the mech hull and all its zones are fully repaired, the exact 0.75 movement penalty is restored to 1.0. Mechs and independent arms use the game repair routine until fully healed, without simultaneous config regeneration or direct HP writes. Upgraded arm resources are now recognized. Zero-HP arms may be repaired only when still present, not engine-dead, authoritative, and attached through the native Attachable chain to a living authoritative mech. Dead, detached or removed arms are not rebuilt. Automated logs record mech zones, death states and zero-HP arm parents. Offline regression tests pass; real movement, arm models and weapon operation require in-game verification. See [mech repair notes](docs/机甲部位修复.md).

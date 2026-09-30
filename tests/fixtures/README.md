@@ -12,5 +12,11 @@ The hand-written Go structure omits fields and must not be used to recompute
 these offsets. This fixture reproduces the v0.14 layout-check failure.
 
 The data is for offline regression testing and is not included in the mod package.
+
+`exo49_health_filediver.bin` is the same-size record for EXO-49 resource
+`c2d449ecf7facab1` from the same public dataset, extracted on 2026-09-30.
+It contains main maximum 1800 and eight zones, including right leg `87b05ff4`
+and left leg `64a3fa1d`, both maximum 550. It verifies full-repair prerequisites
+against a real mech configuration; engine/model behavior is still mocked.
 Game assets and identifiers belong to their respective owners. filediver is
 BSD-3-Clause licensed; no upstream implementation code is included in this fixture.

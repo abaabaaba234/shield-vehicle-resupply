@@ -3,12 +3,22 @@
 -- It never scans or patches executable pages. All calls run in the game's Lua update.
 return function(N, log)
     local ffi = require('ffi')
-    local R = { cache = {}, maps = {}, observations = {}, calls = 0, fixed = 0, next_check = 0 }
+    local R = { cache = {}, maps = {}, observations = {}, calls = 0, fixed = 0, legs_fixed = 0, next_check = 0 }
+    local exo_types = {['79e4b3d2da5e45e3']=true, ['c2d449ecf7facab1']=true,
+        ['7b2326f6fd9c8069']=true, ['35dbf54f016f3624']=true}
+    -- Vehicle Supply Tower's known arm resources; upgrades use observed ammo caps.
+    R.arm_types = {['08f6089289c83d22']=true, ['824b7e0c4c879eb5']=true, ['821d035aa47e3e75']=true,
+        ['bf4167fd26917ab1']=true, ['e5f64dcc3bfe9dd1']=true, ['32c7063b4bcc4208']=true,
+        ['8ca4dfa795a473c8']=true, ['ff9878576a4c543b']=true, ['0a03761d50ba5121']=true,
+        ['3e3a31261a124454']=true, ['0736bee2d6328726']=true, ['17c5d12d8d5dee2c']=true,
+        ['65489809a8181b96']=true, ['df51fe8d62f294be']=true}
     local wheel_names = {'fed0a478', 'f3cb00ad', 'c6bf05a9', 'f12186b7'}
     local U32 = 4294967296
     local signatures = {
         heal = {0x4B9B50, '40 57 48 83 EC 20 48 8B 39 4C 8B 1D ?? ?? ?? ?? 8B 47 08 3B 05 ?? ?? ?? ?? 74 ?? 45 8B 93 ?? ?? ?? ?? 45 33 C0 48 89 5C 24 30 41 8B 9B ?? ?? ?? ?? 0F AF D8 4C 89 74 24 48 45 8D 72 FF 45 85 D2 74 ?? 48 89 6C 24 38 41 8B AB ?? ?? ?? ?? 48 89 74 24 40 49 8B B3 ?? ?? ?? ?? 66 0F 1F 44 00 00 41 8D 14 18 41 8B CE 48 23 D1 44 8B 0C D6 44 3B CD 74 ?? 44 3B C8 74 ?? 41 FF C0 45 3B C2 72 ?? 48 8B 74 24 40 48 8B 6C 24 38 48 8B 5C 24 30 4C 8B 74 24 48 0F 28 D1 8B D0 49 8B CB 48 83 C4 20 5F E9 ?? ?? ?? ??'},
         wheel = {0x11A8490, '48 89 5C 24 18 48 89 6C 24 20 57 48 81 EC C0 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 B0 00 00 00 8B 41 08 8B EA 3B 05 ?? ?? ?? ?? 48 8B 1D ?? ?? ?? ?? 75 ?? B8 FF FF FF FF EB ?? 44 8B 4B 48 33 D2 44 8B 53 50 44 0F AF D0'},
+        stat = {0x9CCAE0, '40 55 3B 15 ?? ?? ?? ?? 4C 8B 15 ?? ?? ?? ?? 49 63 E8 75 ?? B8 FF FF FF FF EB ?? 45 8B 4A 28 33 C9 45 8B 5A 30 48 89 5C 24 10 48 89 74 24 18 44 0F AF DA 41 8D 71 FF 48 89 7C 24 20 45 85 C9 74 ?? 49 8B 5A 20 41 8B 7A 2C 0F 1F 80 00 00 00 00 8B C6 46 8D 04 19 4C 23 C0 42 8B 04 C3 3B C7 74 ?? 3B C2 74 ?? FF C1 41 3B C9 72 ?? B8 FF FF FF FF 48 8B 74 24 18 48 8B 5C 24 10 48 8B 7C 24 20 8B C8 49 8B 42 48 48 6B D1 0D 48 03 D5 F3 0F 11 1C 90 5D C3'},
+        attach = {0x4A52B0, '48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 3B 15 ?? ?? ?? ?? 4C 8B 15 ?? ?? ?? ?? 74 ?? 45 8B 4A 20 45 33 C0 41 8B 5A 28 0F AF DA 41 8D 69 FF 45 85 C9 74 ?? 49 8B 7A 18 41 8B 72 24 0F 1F 40 00 66 66 0F 1F 84 00 00 00 00 00 8B C5 41 8D 0C 18 48 23 C8 8B 04 CF 4C 8D 1C CF 3B C6 74 ?? 3B C2 74 ?? 41 FF C0 45 3B C1 72 ?? 32 C0 48 8B 5C 24 08 48 8B 6C 24 10 48 8B 74 24 18 48 8B 7C 24 20 C3 3B C2 75 ?? 41 8B 43 04 83 F8 FF 74 ?? 48 69 C8 ?? ?? ?? ?? 49 8B 42 ?? 83 3C 01 00 0F 95 C0 EB ??'},
     }
     local ctypes = {
         heal = 'void (*)(void *, uint32_t, float)',
@@ -96,14 +106,33 @@ return function(N, log)
         need(api == rel(p + 0x114, 3, 7), 'VehicleApi roots differ')
         return {query = rel(p + 0xB3, 3, 7), api = api, get = get, set = set}
     end
+    local function resolve_stat()
+        local p = N.base + signatures.stat[1]
+        need(matches(p, signatures.stat[2]), 'stat modifier guard')
+        local tbl = rb(p + 0x44)
+        need(tbl == 0x20 and rb(p + 0x1E) == tbl + 8 and rb(p + 0x48) == tbl + 12
+            and rb(p + 0x24) == tbl + 16 and rb(p + 0x85) == 0x48
+            and matches(p + 0x86, '48 6B D1 0D'), 'stat modifier table/13-float stride')
+        return {root = rel(p + 8, 3, 7), tbl = tbl, rows = 0x48}
+    end
+    local function resolve_attach()
+        local p = N.base + signatures.attach[1]
+        need(matches(p, signatures.attach[2]), 'attachable parent guard')
+        local tbl, stride, rows = rb(p + 0x3D), r32(p + 0x97), rb(p + 0x9E)
+        need(tbl == 0x18 and rb(p + 0x26) == tbl + 8 and rb(p + 0x41) == tbl + 12
+            and rb(p + 0x2D) == tbl + 16, 'attachable table layout')
+        need(stride and stride >= 4 and stride < 0x1000 and stride % 4 == 0
+            and rows and rows >= tbl + 24 and rows < 0x100 and rows % 8 == 0, 'attachable rows/stride')
+        return {root = rel(p + 0x1A, 3, 7), tbl = tbl, rows = rows, stride = stride}
+    end
     function R.ensure(now)
         if not N.ready then return false end
-        if R.base == N.base and now < R.next_check then return R.health ~= nil or R.wheels ~= nil end
+        if R.base == N.base and now < R.next_check then return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil end
         R.base, R.next_check = N.base, now + 10
         N.win.begin_sample()
         local exe_ok, exe = pcall(resolve_exe)
         R.exe = exe_ok and exe or nil
-        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel}) do
+        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach}) do
             local ok, value = pcall(resolve)
             R[name] = ok and value or nil
             local status = ok and 'ok' or tostring(value)
@@ -112,7 +141,7 @@ return function(N, log)
                 log('repair native %s: %s', name, status)
             end
         end
-        return R.health ~= nil or R.wheels ~= nil
+        return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil
     end
     function R.invoke(name, p, ...)
         need(in_engine(p) and read(p, 1), 'native function outside readable game modules')
@@ -128,23 +157,107 @@ return function(N, log)
         R.calls = R.calls + 1
         return fn(...)
     end
-    local function owner(d)
+    local function owner_graph(d)
         local g = N.sample_graph()
         local net, hm = g:root('network'), g:root('health')
         g:roundtrip(net, d)
         local i, hd = g:component(hm, d.entity, 0x1030, 0x1048)
         need(i ~= nil and N.same(hd, d) and hd.flags % 2 == 1, 'repair requires current authoritative owner')
         local rec = N.ptr(g:watch(hm + 0x1058, 8), 0) + i * 0x1B8
-        need(N.i32(g:read(rec + 0x14, 4), 0) > 0 and N.u32(g:read(rec + 0x19C, 4), 0) == 0, 'repair does not revive dead vehicles')
+        return g, hm, rec
+    end
+    local function mounted_parent(g, d)
+        need(R.attach ~= nil, R.attach_status or 'attachable interface unavailable')
+        local am = N.ptr(g:watch(R.attach.root, 8), 0)
+        local t = g:table(am + R.attach.tbl)
+        local rows = N.ptr(g:watch(am + R.attach.rows, 8), 0)
+        local net, hm = g:root('network'), g:root('health')
+        local cur, seen = d.entity, {}
+        for _ = 1, 4 do
+            need(not seen[cur], 'cyclic arm attachment'); seen[cur] = true
+            local row = g:lookup(t, cur)
+            if row == nil then return nil, 'arm has no attachment row' end
+            local parent = N.u32(g:watch(rows + row * R.attach.stride, 4), 0)
+            if parent == 0 or parent == 0xFFFFFFFF then return nil, 'arm is detached' end
+            local pd = g:net(net, parent, true)
+            need(pd ~= nil, 'arm attachment parent no longer exists')
+            g:roundtrip(net, pd)
+            if exo_types[pd.resource] then
+                local i, hd = g:component(hm, pd.entity, 0x1030, 0x1048)
+                need(i ~= nil and N.same(hd, pd) and hd.flags % 2 == 1, 'arm parent is not authoritative')
+                local rec = N.ptr(g:watch(hm + 0x1058, 8), 0) + i * 0x1B8
+                need(N.i32(g:watch(rec + 0x14, 4), 0) > 0 and N.u32(g:watch(rec + 0x19C, 4), 0) == 0, 'arm parent is dead')
+                return pd
+            end
+            cur = parent
+        end
+        return nil, 'no exosuit in arm attachment chain'
+    end
+    local function owner(d, empty_arm)
+        local g, hm, rec = owner_graph(d)
+        local hp = N.i32(g:watch(rec + 0x14, 4), 0)
+        need(N.u32(g:watch(rec + 0x19C, 4), 0) == 0, 'repair does not revive dead vehicles')
+        if hp <= 0 then
+            need(empty_arm and R.arm_types[d.resource] and hp > -1000000, 'repair does not revive dead vehicles')
+            local parent, why = mounted_parent(g, d)
+            need(parent ~= nil, why)
+        end
         g:validate()
         return hm
     end
-    function R.heal(d, fraction)
+    function R.heal(d, fraction, empty_arm)
         if not R.health then return false, R.health_status end
         if type(fraction) ~= 'number' or fraction ~= fraction or fraction <= 0 or fraction > 1 then return false, 'invalid repair fraction' end
-        local hm = owner(d)
+        local hm = owner(d, empty_arm)
         need(rq(R.health.root) == hm, 'repair manager changed')
         R.invoke('heal', R.health.fn, pointer(hm), d.entity, fraction)
+        return true
+    end
+    function R.arm_parent(d)
+        need(R.arm_types[d.resource], 'unsupported arm resource')
+        local g = owner_graph(d)
+        local pd, why = mounted_parent(g, d)
+        g:validate()
+        return pd, why
+    end
+    -- The first float in the guarded 13-float StatModifier row is movement speed.
+    -- Health/zone maxima are read fresh here; a stale "full" snapshot cannot cure a leg.
+    function R.fix_leg(d, cfg, zones, write_float, config_address)
+        if not exo_types[d.resource] then return false, 'not an exosuit' end
+        if not R.stats then return false, R.stats_status end
+        local g, hm, rec = owner_graph(d)
+        need(config_address(g, g:root('network'), hm, d) == cfg, 'leg Health config owner changed')
+        need(N.u32(g:watch(rec + 0x19C, 4), 0) == 0, 'exosuit is dead')
+        local mx = N.i32(g:watch(cfg, 4), 0)
+        need(mx > 0 and mx <= 10000000, 'invalid exosuit maximum')
+        if N.i32(g:watch(rec + 0x14, 4), 0) < mx then return false, 'exosuit is not fully repaired' end
+        local has_leg, count = false, 0
+        local state = N.u32(g:watch(rec + 0x20, 4), 0)
+        for _, z in ipairs(zones) do
+            need(z.i == count and count < 38, 'incomplete leg zone list'); count = count + 1
+            local p = cfg + 0x208 + z.i * 0x228
+            need(string.format('%08x', N.u32(g:watch(p + 0x60, 4), 0)) == z.hash, 'leg zone identity changed')
+            local zm = N.i32(g:watch(p + 0xE8, 4), 0)
+            if zm == -1 then zm = mx end
+            need(zm == z.max, 'leg zone maximum changed')
+            if z.hash == '87b05ff4' or z.hash == '64a3fa1d' then has_leg = true end
+            if zm > 0 and (N.i32(g:watch(rec + 0xF8 + z.i * 4, 4), 0) < zm
+                or (z.i < 16 and math.floor(state / 4 ^ z.i) % 4 == 2)) then
+                return false, 'exosuit is not fully repaired'
+            end
+        end
+        need(has_leg, 'no known exosuit leg zone')
+        if count < 38 then need(N.u32(g:watch(cfg + 0x208 + count * 0x228 + 0x60, 4), 0) == 0, 'incomplete leg zone list') end
+        local sm = N.ptr(g:watch(R.stats.root, 8), 0)
+        local row = g:lookup(g:table(sm + R.stats.tbl), d.entity)
+        if row == nil then return false, 'no stat modifier row' end
+        local a = N.ptr(g:watch(sm + R.stats.rows, 8), 0) + row * 52
+        local raw = g:watch(a, 4)
+        if raw ~= '\0\0\64\63' then return false, 'no 0.75 leg penalty' end
+        g:validate()
+        if not write_float(a, raw, 1.0) or read(a, 4) ~= '\0\0\128\63' then return false, 'leg speed write/readback failed' end
+        R.legs_fixed = R.legs_fixed + 1
+        log('exo leg repaired %s ent=%d speed=0.75->1.0 (fully repaired)', d.resource, d.entity)
         return true
     end
     local function wheel_access(d)

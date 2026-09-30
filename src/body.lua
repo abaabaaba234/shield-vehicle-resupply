@@ -36,6 +36,7 @@ local C = {
     tires          = true,   -- FRV：用 VehicleApi 恢复完好轮胎参数和爆胎标志；模型不重建
     wheel_interval = 2.0,    -- 每辆 FRV 至多每隔这些秒修一个轮胎
     part_repair    = true,   -- 调用游戏维修函数处理已毁部位；整车接口要求所有部位均未禁用
+    exo_leg_fix    = true,   -- 机甲完全修好后恢复腿损坏留下的 0.75 移速倍率
     net_heal       = true,   -- 用引擎 set_game_object_field 给坦克/FRV 车体（HUD 显示的网络血量）回血（v0.8b 实测 FRV 可行）
     hull_zones     = true,   -- 坦克/FRV：被打爆部位的 HP 数值也回满（模型不变），车体血量才会回（v0.8 推断：车体 = 上限 - 各部位损失）
     authority_only = true,   -- 只改本机有权威的组件（descriptor flags bit0）
@@ -126,6 +127,7 @@ local function log(fmt, ...)
     if f then f:write(os.date('%H:%M:%S '), ok and s or fmt, '\n'); f:close() end
 end
 local REPAIR = RepairNative(N, log)
+for res in pairs(REPAIR.arm_types) do KIND[res] = 'arm'; ARM_WEAPON[res] = true end
 
 local stage_seen = {}
 local function stage(name)
@@ -156,7 +158,7 @@ local function read_settings()
         if f then
             f:write('# Shield Vehicle Resupply 设置。改完在 shield_resupply_cmd.txt 写 reload\n',
                 '# shield=<16位hex> 可写多行；weapon=<hex> 同理；ammo_max=<hex>:<字段>=<数值>\n',
-                'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=1\nwheel_interval=2\npart_repair=1\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
+                'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=1\nwheel_interval=2\npart_repair=1\nexo_leg_fix=1\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
                 'ammo_rate=0.10\ncooldown=2\nauthority_only=1\nheal=native\nnative_zone=0x141\npart_regen=1\nnative_segments=1\nnative_force=1\n',
                 '# part=<16位资源hash>:<8位部位hash>=0|1，可写多行；parts 命令列出这些 hash\n')
             f:close()
@@ -194,6 +196,7 @@ local function read_settings()
     local n = 0; for _ in pairs(C.shield) do n = n + 1 end
     log('settings: radius=%.1f heal=%s native_zone=%s test=%s revive=%s hull_zones=%s tires=%s ammo=%s shields=%d',
         C.radius, C.heal, C.native_zone > 0 and string.format('+%x', C.native_zone) or 'off', tostring(C.test), tostring(C.revive), tostring(C.hull_zones), tostring(C.tires), tostring(C.ammo), n)
+    log('settings: part_repair=%s exo_leg_fix=%s', tostring(C.part_repair), tostring(C.exo_leg_fix))
 end
 local function load_settings() read_settings(); rebuild_res() end
 
@@ -333,6 +336,7 @@ local function reset_context()
     S.shield_born, S.shield_expired, S.vstate, S.want_units = {}, {}, {}, nil
     S.hptrace = nil
     S.wheel_trace, S.next_wheel_learn = nil, 0
+    S.mech_trace = nil
     REPAIR.reset()
 end
 
@@ -537,7 +541,34 @@ local function rebuild_roster()
         by_entity[d.entity] = v
     end
     S.vehicles = vehicles
-    for k, v in pairs(S.vstate) do if v.alive_at ~= S.clock then S.vstate[k] = nil end end
+    for k, v in pairs(S.vstate) do
+        if v.alive_at ~= S.clock then
+            if v.kind == 'arm' then log('mech arm removed %s ent=%d goid=%d: Health owner disappeared; no respawn path', v.d.resource, v.d.entity, v.d.goid) end
+            S.vstate[k] = nil
+        end
+    end
+    -- A destroyed arm may no longer have an alive Unit, so range/position lookup
+    -- would skip heal() and its trace. Record this read-only evidence during roster.
+    local rows_raw = N.win.read(hm + 0x1058, 8)
+    local rows = rows_raw and ptr(rows_raw, 0)
+    if rows and rows >= 65536 then
+        for _, v in ipairs(vehicles) do
+            if v.kind == 'arm' then
+                local b = N.win.read(rows + v.d.j * 0x1B8, 0x1B8)
+                if b then
+                    local hp, life = i32(b, 0x14), u32(b, 0x19C)
+                    if hp <= 0 or life ~= 0 then
+                        local report = 'arm-health:' .. v.d.entity .. ':' .. v.d.goid .. ':' .. tostring(life)
+                        if not S.reported[report] then
+                            S.reported[report] = true
+                            log('mech arm unavailable %s ent=%d goid=%d hp=%d life=%08x: %s', v.d.resource, v.d.entity, v.d.goid, hp, life,
+                                life ~= 0 and 'engine-dead; no respawn path' or 'zero HP; game repair requires a live native parent')
+                        end
+                    end
+                end
+            end
+        end
+    end
     local by_goid = {}
     for _, v in ipairs(vehicles) do
         local offs = v.kind == 'tank' and TANK_WEAPON_GOIDS[v.d.resource]
@@ -1087,7 +1118,7 @@ local function trace_wheels(v, data, zc, cfg, native_zones)
     end
 end
 
-local function repair_destroyed(v, zones, data, rate, dt, key)
+local function repair_parts(v, zones, data, rate, dt, key, cfg)
     if rate <= 0 then return 0 end
     local d, changed = v.d, 0
     local function report(prefix, reason)
@@ -1097,17 +1128,19 @@ local function repair_destroyed(v, zones, data, rate, dt, key)
             log('%s %s ent=%d: %s', prefix, v.kind, d.entity, reason)
         end
     end
-    if C.part_repair then
-        local damaged, all_selected = false, true
-        for _, z in ipairs(zones) do
-            if z.max > 0 then
-                if not part_enabled(d.resource, z.hash) then all_selected = false end
-                local bits = z.i < 16 and math.floor(u32(data, 0x20) / 4 ^ z.i) % 4 or 0
-                if (z.hp <= 0 and z.hp > -1000000) or bits == 2 then damaged = true end
-            end
+    local mech = v.kind == 'exo' or v.kind == 'arm'
+    local damaged = mech and i32(data, 0x14) < v.zcache.mx or false
+    local all_selected = true
+    for _, z in ipairs(zones) do
+        if z.max > 0 then
+            if not part_enabled(d.resource, z.hash) then all_selected = false end
+            local bits = z.i < 16 and math.floor(u32(data, 0x20) / 4 ^ z.i) % 4 or 0
+            if (z.hp > -1000000 and z.hp < (mech and z.max or 1)) or bits == 2 then damaged = true end
         end
+    end
+    if C.part_repair then
         if damaged and all_selected then
-            local ok, done, why = pcall(REPAIR.heal, d, math.min(1, rate * dt))
+            local ok, done, why = pcall(REPAIR.heal, d, math.min(1, rate * dt), v.kind == 'arm')
             if ok and done then
                 changed = changed + 1
                 report('part repair', 'game repair function')
@@ -1115,6 +1148,12 @@ local function repair_destroyed(v, zones, data, rate, dt, key)
         elseif damaged and not all_selected then
             report('part repair skip', 'a part is disabled; game repair function affects all zones')
         end
+    end
+    if C.exo_leg_fix and v.kind == 'exo' and not damaged and all_selected then
+        local ok, done, why = pcall(REPAIR.fix_leg, d, cfg, zones, W.f32, config_address)
+        if ok and done then changed = changed + 1
+        elseif not ok or (why and why ~= 'no 0.75 leg penalty' and why ~= 'no stat modifier row'
+            and why ~= 'exosuit is not fully repaired') then report('exo leg repair skip', tostring(ok and why or done)) end
     end
     if C.tires and v.kind == 'frv' and S.clock >= (v.next_wheel or 0) then
         v.next_wheel = S.clock + math.max(0.5, C.wheel_interval)
@@ -1141,6 +1180,32 @@ local function repair_destroyed(v, zones, data, rate, dt, key)
     return changed
 end
 
+-- Capture mech part transitions automatically while serviced, including independent arm death.
+local function trace_mech(v, data, zones)
+    if v.kind ~= 'exo' and v.kind ~= 'arm' then return end
+    local key = v.d.entity .. ':' .. v.d.goid .. ':' .. v.d.resource
+    S.mech_trace = S.mech_trace or {}
+    local seen = S.mech_trace[key] or {next_t = 0}; S.mech_trace[key] = seen
+    if S.clock < seen.next_t then return end
+    seen.next_t = S.clock + 2
+    local life, hp = u32(data, 0x19C), i32(data, 0x14)
+    local snapshot = string.format('%d:%d:%08x', hp, life, u32(data, 0x20))
+    for _, z in ipairs(zones) do snapshot = snapshot .. ':' .. z.hp end
+    if seen.value == snapshot then return end
+    seen.value = snapshot
+    log('mech health %s %s ent=%d hp=%d/%d life=%08x (nonzero=dead)', v.kind, v.d.resource, v.d.entity, hp, v.zcache.mx, life)
+    for _, z in ipairs(zones) do
+        log('mech part %s ent=%d zone=%s hp=%d/%d state=%s selected=%s', v.kind, v.d.entity, z.hash, z.hp, z.max,
+            z.i < 16 and tostring(math.floor(u32(data, 0x20) / 4 ^ z.i) % 4) or '?', tostring(part_enabled(v.d.resource, z.hash)))
+    end
+    if v.kind == 'arm' and hp <= 0 then
+        local ok, parent, why = pcall(REPAIR.arm_parent, v.d)
+        log('mech arm ent=%d parent=%s life=%08x: %s', v.d.entity, ok and parent and tostring(parent.entity) or '?', life,
+            life ~= 0 and 'engine-dead arm; reference mod has no reattach/respawn path'
+                or (ok and parent and 'mounted zero-HP arm can use game repair' or tostring(ok and why or parent)))
+    end
+end
+
 local function heal(v, dt)
     if C.heal == 'off' then return 'heal off' end
     local d = v.d
@@ -1153,12 +1218,27 @@ local function heal(v, dt)
     end
 
     local hp = i32(data, 0x14)
-    if hp <= 0 then return 'dead' end  -- 不复活
+    trace_mech(v, data, zones)
+    if u32(data, 0x19C) ~= 0 then return 'dead' end
+    if hp <= 0 then
+        if v.kind ~= 'arm' or not C.part_repair or hp <= -1000000 then return 'dead' end
+        local ok, parent = pcall(REPAIR.arm_parent, d)
+        if not ok or not parent then return 'detached_arm' end
+    end
     local rate = C[HEAL_RATE[v.kind]]
+    -- Mechs use one healing backend: the engine repair function also heals main HP.
+    -- Running config regeneration alongside it would double exo_heal and may consume
+    -- the damaged-zone transition before the engine's repair event can handle it.
+    local engine_mech = (v.kind == 'exo' or v.kind == 'arm') and C.part_repair and REPAIR.health ~= nil
+    if engine_mech then
+        for _, z in ipairs(zones) do
+            if z.max > 0 and not part_enabled(d.resource, z.hash) then engine_mech = false; break end
+        end
+    end
     -- v0.13：主血量交给游戏自带的回血（打开 HealthComponent 配置里的开关/速率）。
     -- 游戏自己涨的血不会在下一次受伤时被它另存的那份血量盖回去，所以不用扫内存。
     local native_zones = {}
-    if C.heal == 'native' and cfg then
+    if C.heal == 'native' and cfg and not engine_mech then
         local _, active = native_apply(v, cfg, mx, mx * rate, zc)
         native_zones = active or {}
     end
@@ -1172,8 +1252,8 @@ local function heal(v, dt)
     S.last_total[key] = total
     if C.cooldown > 0 and S.last_hit[key] and S.clock - S.last_hit[key] < C.cooldown then return 'cooldown' end
 
-    local changed = repair_destroyed(v, zones, data, rate, dt, key)
-    if C.heal == 'write' and hp < mx then  -- native 模式下主血量由游戏负责，mod 不写
+    local changed = repair_parts(v, zones, data, rate, dt, key, cfg)
+    if C.heal == 'write' and not engine_mech and hp < mx then  -- 游戏维修函数也处理主血量
         local n = amount(key .. ':h', mx, rate, dt)
         if n > 0 and W.i32(rec + 0x14, hp, math.min(mx, hp + n)) then changed = changed + 1 end
     end
@@ -1181,7 +1261,7 @@ local function heal(v, dt)
     for _, z in ipairs(zones) do
         -- 已开启原生再生的部位（包含 HP<=0）由游戏负责，保留 OnHeal 的触发机会。
         -- 按部位禁用时也不走逐帧回填；native_zone=0 可退回原先的修血路径。
-        if part_enabled(d.resource, z.hash) and not native_zones[z.i] and z.max > 0 and z.hp < z.max then
+        if not engine_mech and part_enabled(d.resource, z.hash) and not native_zones[z.i] and z.max > 0 and z.hp < z.max then
             local zk = key .. z.key
             local zo = 0xF8 + 4 * z.i
             if z.hp > 0 then
@@ -1328,7 +1408,7 @@ local function cmd_vehicles()
                 if u32(b, 0) == 0 then break end
                 zs[#zs + 1] = string.format('%08x=%d/%d', u32(b, 0), i32(data, 0xF8 + 4 * i), i32(b, 136))
             end
-            return string.format('hp=%d/%d state=%08x zones[%s]', i32(data, 0x14), i32(g:read(cfg, 4), 0), u32(data, 0x20), table.concat(zs, ' '))
+            return string.format('hp=%d/%d state=%08x life=%08x zones[%s]', i32(data, 0x14), i32(g:read(cfg, 4), 0), u32(data, 0x20), u32(data, 0x19C), table.concat(zs, ' '))
         end)
         local extra = ''
         if v.kind == 'tank' or v.kind == 'frv' then
@@ -1615,6 +1695,9 @@ local function cmd_status()
     log('status: enabled=%s heal=%s test=%s native=%s weapon=%s vehicles=%d weapons=%d shields_cfg=%d shields_live=%d native_open=%d forced=%d writes=%d fails=%d',
         tostring(C.enabled), C.heal, tostring(C.test), tostring(N.ready), tostring(N.weapon_ready), #S.vehicles, #S.weapons, n, #S.shields,
         ncfg, W.forced or 0, W.writes, W.fails)
+    log('status: part_repair=%s exo_leg_fix=%s legs_fixed=%d health_guard=%s stat_guard=%s attach_guard=%s',
+        tostring(C.part_repair), tostring(C.exo_leg_fix), REPAIR.legs_fixed,
+        tostring(REPAIR.health_status), tostring(REPAIR.stats_status), tostring(REPAIR.attach_status))
     for _, d in ipairs(S.shields) do log('  shield %s ent=%d goid=%d at %s', d.resource, d.entity, d.goid, fmtpos(position_of(d))) end
 end
 
@@ -1674,7 +1757,7 @@ local function tick(dt)
         return
     end
     stage('native layout ok')
-    if C.enabled and (C.tires or C.part_repair) then REPAIR.ensure(S.clock) end
+    if C.enabled and (C.tires or C.part_repair or C.exo_leg_fix) then REPAIR.ensure(S.clock) end
     if N.weapon_base ~= N.base then
         N.weapon_base = N.base
         N.win.begin_sample()
@@ -1830,5 +1913,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.15 (游戏维修函数与 VehicleApi 爆胎修复；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.16 (机甲腿部移速与独立手臂维修；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }
