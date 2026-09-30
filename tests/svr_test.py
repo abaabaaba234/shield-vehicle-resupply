@@ -1,5 +1,10 @@
-import struct, os, sys
+import struct, os, sys, tempfile
+from pathlib import Path
 from lupa import luajit21 as lj
+# Keep standalone and embedded harnesses away from the user's game files.
+test_root=Path(__file__).resolve().parent
+if not Path(os.environ.get('LOCALAPPDATA','')).resolve().is_relative_to(test_root):
+    os.environ['LOCALAPPDATA']=tempfile.mkdtemp(prefix='.run-svr-',dir=test_root)
 class Mem:
     def __init__(s): s.pages={}
     def w(s,a,b):
