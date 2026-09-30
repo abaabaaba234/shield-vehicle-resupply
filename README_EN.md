@@ -26,9 +26,9 @@ All files are in `%LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\`:
 
 Commands: `status`, `on`, `off`, `reload`, `test`, `vehicles`, `parts`, `weapons`, `units`, `recent [n]`, `healcfg`, `hptrace [secs]`, `heal native|write|off`, `probe`, `netinfo`, `netset`. The Chinese README has the full settings table.
 
-Key healing settings: `heal` (`native` by default: use the game's own regeneration; `write`: the old per-tick HP write, kept as a fallback; `off`), `native_zone` (`0x13d` by default, derived from filediver's layout and guarded per part; `0` uses the old part HP writes), `part_regen` (default `1`), `native_segments`, `native_force`.
+Key healing settings: `heal` (`native` by default: use the game's own regeneration; `write`: the old per-tick HP write, kept as a fallback; `off`), `native_zone` (`0x141` by default, confirmed by filediver's binary type library and guarded per part; `0` uses the old part HP writes), `part_regen` (default `1`), `native_segments`, `native_force`.
 
-Use `parts` to list resource/zone hashes. Independently choose a part with `part=<16-digit resource hash>:<8-digit zone hash>=0|1`; entries override `part_regen`. Disabled parts are also excluded from the old HP-write fallback. Existing settings with `native_zone=0` need updating to `0x13d` to try this feature.
+Use `parts` to list resource/zone hashes. Independently choose a part with `part=<16-digit resource hash>:<8-digit zone hash>=0|1`; entries override `part_regen`. Disabled parts are also excluded from the old HP-write fallback. Existing settings with `native_zone=0` need updating to `0x141` to try this feature.
 
 ## How it works
 - It reuses DRIVER HUD / HUD's read-only native reader: the Health and Magazine/Rounds component layouts plus their code guards.
@@ -39,7 +39,7 @@ Use `parts` to list resource/zone hashes. Independently choose a part with `part
   sanity-checked before any write, and the original values are written back when no authoritative vehicle
   is inside the shield. This is what replaced the v0.12 memory scan (and its stutter).
 - Writes:
-  - v0.14 enables each selected damage zone's own regeneration, including zones with nonpositive HP. The mod leaves HP and damage-state transitions to the game for those zones. Original flags are restored on exit, off, and reload; failed restores are retained for retries. Model/physics restoration remains unverified.
+  - v0.15 enables each selected damage zone's own regeneration using the corrected +0x141 flag, including zones with nonpositive HP. Original flags are restored on exit, off, and reload; failed restores are retained for retries. The separate game repair and tyre interfaces are described below; real engine/model behavior remains unverified.
   - The old HP-write fallback and ammo components use in-process `WriteProcessMemory` on `PAGE_READWRITE` pages, with compare-before-write and readback checks.
   - Tank/FRV hull HP is written with `GameSession.set_game_object_field`, and only for objects this machine owns.
 - While no shield is up, the mod only runs a light scan every 3 s and restores the config values.
@@ -51,7 +51,7 @@ v0.13 instead enables the game's built-in regeneration, so the game keeps both c
 
 - The config is shared per unit resource, so it is only enabled while an authoritative vehicle of that type is
   inside the shield, and restored right after. During that time, other vehicles of the same type regenerate too.
-- The per-zone offset is derived from the upstream schema and checked against zone names, HP limits, neighboring booleans, floats and child-zone references. This does not prove that the game will regrow detached models or restore disabled physics actors. Dead/removed independent entities such as arms are not respawned.
+- The per-zone offset is confirmed by the upstream binary type library and checked against zone names, HP limits, neighboring booleans, floats and child-zone references, including a real FRV regression fixture. This does not prove that the game will regrow detached models or restore disabled physics actors. Dead/removed independent entities such as arms are not respawned.
 - `parts` reports the configuration flag and healing event; configuration `regen=1` alone is not proof of successful repair. See [docs/部位再生.md](docs/部位再生.md) for the in-game experiment (Chinese).
 - Details, field table and how to verify in game: [docs/回血原理.md](docs/回血原理.md) (Chinese).
 
@@ -70,3 +70,5 @@ python tests/part_regen_test.py   # all 38 parts / individual selection / layout
 
 ## License
 MIT, see [LICENSE](LICENSE). The native reader in `src/vendor/` is by FireScallion (MIT). See [CREDITS.md](CREDITS.md).
+
+In v0.15, `part_repair=1` calls the game repair routine for destroyed zones of a living vehicle; it is skipped if any zone is disabled because the routine affects the whole unit. `tires=1` restores FRV tyre parameters through VehicleApi, at most one tyre per vehicle every `wheel_interval=2` seconds. Intact samples are learned by vehicle type and API index, including outside the shield. Spawn an intact FRV of the same type if the necessary sample is missing. Tyre visuals are not rebuilt. Selective tyres require API/Health index mappings learned from isolated damage; ambiguous mappings are skipped. Restart the game after replacing the package. Offline tests do not establish real game/physics behavior. See [repair notes](docs/部位修复与爆胎.md).

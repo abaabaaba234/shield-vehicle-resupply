@@ -13,8 +13,12 @@
     `Health` / `HeathChangerate` / `HealthChangerateDisabled` / `HeathChangerateCooldown` /
     `RegenerationSegments` / `RegenerationChangerate`, and `DamageableZoneInfo.RegenerationEnabled`) comes from
     filediver's `datalibrary` package, which mirrors the game's plaintext data. No filediver code is redistributed here.
-  - v0.14 derives the per-zone regeneration offset and neighboring layout checks from
-    [DamageableZoneInfo](https://github.com/xypwn/filediver/blob/master/datalibrary/health_component.go).
+  - v0.15 corrects the per-zone offsets using the 64-bit metadata in
+    [dl_library.dl_typelib.gz](https://github.com/xypwn/filediver/blob/master/datalibrary/dl_library.dl_typelib.gz),
+    with a regression fixture extracted from its public generated_entities.dl_bin.gz.
+    v0.14 incorrectly derived the offset from an incomplete hand-written Go structure.
     Its `OnHealScriptEvent` and `OnDeadDisableAllActors` fields are exposed as diagnostics; their presence
     is not treated as proof that detached models or physics actors can be restored.
 - Helldivers 2 and its assets, names and identifiers belong to their respective owners. This project is not affiliated with or endorsed by Arrowhead, Sony, or the upstream authors.
+
+- **Vehicle Supply Tower 1.0.1**, user-provided local reference (`mods/codex/vehicle_supply_tower`): its Lua implementation identifies the repair-drone wrapper, game repair ABI, VehicleApi getter/setter slots, four-wheel resource header and 48-byte intact tyre restoration. `src/repair_native.lua` implements these interfaces for the existing shield service, with its own ownership, configuration, selection, mapping and readback logic. The full supply-tower addon is not redistributed, and its Tesla, ammo and stat-modifier features are not included.

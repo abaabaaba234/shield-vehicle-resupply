@@ -6,7 +6,7 @@
 """
 import os, subprocess, sys
 
-VERSION = 'v0.14'
+VERSION = 'v0.15'
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src = os.path.join(root, 'src')
 dist = os.path.join(root, 'dist')
@@ -25,6 +25,9 @@ out = '\n'.join([
     ' local G=getmetatable(N.graph(function() end,0)).__index',
     read('vendor', 'weapon_driverhud.lua'),
     'end',
+    'local RepairNative=(function()',
+    read('repair_native.lua'),
+    'end)()',
     read('body.lua'),
 ])
 os.makedirs(dist, exist_ok=True)

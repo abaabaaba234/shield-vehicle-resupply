@@ -42,7 +42,7 @@ def scenario(name, zones=2):
         mem.w(base + 0xE8, struct.pack('<i', 400))
         mem.w(rec + 0xF8 + 4 * i, struct.pack('<i', -40 if i % 2 else 100))
         # Valid but nonzero neighbors catch accidental writes to the bool-run start.
-        mem.w(base + 0x13C, b'\1\0\1\1')
+        mem.w(base + 0x140, b'\1\0\1\1')
     return mem, lua, cfg, rec, logs
 
 
@@ -52,7 +52,7 @@ def run(lua, n=40):
 
 
 def flag(cfg, i):
-    return cfg + 0x208 + i * 0x228 + 0x13D
+    return cfg + 0x208 + i * 0x228 + 0x141
 
 
 def command(lua, logs, text):
@@ -91,7 +91,7 @@ print('PASS: zones with maximum -1 use the main health maximum')
 mem, lua, cfg, rec, logs = scenario('individual control')
 mem.w(flag(cfg, 0), b'\1')  # Original engine behavior must be restored too.
 (logs / 'shield_resupply_settings.txt').write_text(
-    'test=1\nheal=native\nnative_zone=0x13d\npart_regen=0\n'
+    'test=1\nheal=native\nnative_zone=0x141\npart_regen=0\n'
     'part=35dbf54f016f3624:a0000001=1\n'
     'part=35dbf54f016f3624:a0000000=0\n'
     'part=79e4b3d2da5e45e3:a0000001=0\n', encoding='utf-8')
@@ -105,12 +105,13 @@ assert mem.r(rec, 0x1B8) == before, 'disabled part bypassed via HP writes'
 command(lua, logs, 'reload\n')
 assert mem.r(flag(cfg, 0), 1) == b'\1'
 assert mem.r(flag(cfg, 1), 1) == b'\0'
-assert mem.r(flag(cfg, 1) - 0x13D, 1) == b'\0', 'restored to the new offset'
+assert mem.r(flag(cfg, 1) - 0x141, 1) == b'\0', 'restored to the new offset'
 assert lua.eval(b'next(SVR.C.part)') is None, 'removed per-part settings persisted'
 print('PASS: independent policies scoped by vehicle hash, reload/removal/offset changes')
 
 for field, raw in ((0xF0, b'\2'), (0xF8, struct.pack('<f', float('nan'))),
-                   (0xFC, struct.pack('<I', 0xDEADBEEF)), (0x13D, b'\2')):
+                   (0x100, struct.pack('<I', 0xDEADBEEF)), (0x141, b'\2'),
+                   (0x144, struct.pack('<f', float('nan'))), (0x148, struct.pack('<f', float('inf')))):
     mem, lua, cfg, rec, logs = scenario('bad zone')
     p = cfg + 0x208 + field
     mem.w(p, raw)
@@ -186,3 +187,36 @@ assert struct.unpack('<i', mem.r(rec + 0x14, 4))[0] == 1800
 assert struct.unpack('<i', mem.r(rec + 0xF8, 4))[0] == 100
 assert struct.unpack('<i', mem.r(rec + 0xFC, 4))[0] == -40
 print('PASS: write fallback still heals the vehicle and honors disabled parts')
+
+# Real data catches the missing float at +FC and the non-boolean enum at +158.
+# The old zero-filled mocks accepted v0.14's wrong +13D derivation.
+mem, lua, cfg, rec, logs = scenario('filediver FRV', 35)
+fixture = (ROOT / 'tests/fixtures/frv_health_filediver.bin').read_bytes()
+assert len(fixture) == 0x5650
+mem.w(cfg, fixture)
+before = mem.r(cfg, 0x5650)
+run(lua, 10)
+after = mem.r(cfg, 0x5650)
+count = 0
+for i in range(38):
+    base = cfg + 0x208 + i * 0x228
+    if mem.r(base + 0x60, 4) == b'\0' * 4:
+        break
+    count += 1
+    assert mem.r(flag(cfg, i), 1) == b'\1', (i, (logs / 'ShieldVehicleResupply.log').read_text(encoding='utf-8'))
+    assert mem.r(base + 0x13C, 4) == before[base - cfg + 0x13C:base - cfg + 0x140], 'modified ChildZones'
+    assert mem.r(base + 0x158, 4) == before[base - cfg + 0x158:base - cfg + 0x15C], 'modified hit effect enum'
+assert count == 35
+log = (logs / 'ShieldVehicleResupply.log').read_text(encoding='utf-8')
+assert 'on=35/35 blocked=0' in log
+command(lua, logs, 'off\n')
+assert mem.r(cfg, 0x5650) == before, 'real FRV configuration not restored exactly'
+print('PASS: real filediver FRV, 35/35 zones enabled, nonzero enum and children preserved/restored')
+
+mem, lua, cfg, rec, logs = scenario('v0.14 migration')
+(logs / 'shield_resupply_settings.txt').write_text('test=1\nheal=native\nnative_zone=0x13d\n', encoding='utf-8')
+command(lua, logs, 'reload\n')
+assert lua.eval(b'SVR.C.native_zone') == 0x141
+assert mem.r(flag(cfg, 0), 1) == b'\1'
+assert mem.r(flag(cfg, 0) - 4, 1) == b'\0', 'legacy ChildZones byte was written'
+print('PASS: legacy v0.14 setting migrated to +141 without writing +13D')

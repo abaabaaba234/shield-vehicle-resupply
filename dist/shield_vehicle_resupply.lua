@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply
--- Shield Vehicle Resupply v0.14
+-- Shield Vehicle Resupply v0.15
 -- Native read layer: DRIVER HUD 1.4.5 / HUD 1.11.1, Copyright (c) 2026 FireScallion, MIT License
 -- (see third_party/LICENSE-DRIVER-HUD.txt). Writes are added by this mod.
 local N=(function()
@@ -504,6 +504,308 @@ function G:weapon_component(d,root_rva,to,dp,array_offset,stride,n)
 end
 
 end
+local RepairNative=(function()
+-- Native repair interfaces identified in the user-provided Vehicle Supply Tower 1.0.1.
+-- This module uses fixed, guarded call sites on the already validated HUD build.
+-- It never scans or patches executable pages. All calls run in the game's Lua update.
+return function(N, log)
+    local ffi = require('ffi')
+    local R = { cache = {}, maps = {}, observations = {}, calls = 0, fixed = 0, next_check = 0 }
+    local wheel_names = {'fed0a478', 'f3cb00ad', 'c6bf05a9', 'f12186b7'}
+    local U32 = 4294967296
+    local signatures = {
+        heal = {0x4B9B50, '40 57 48 83 EC 20 48 8B 39 4C 8B 1D ?? ?? ?? ?? 8B 47 08 3B 05 ?? ?? ?? ?? 74 ?? 45 8B 93 ?? ?? ?? ?? 45 33 C0 48 89 5C 24 30 41 8B 9B ?? ?? ?? ?? 0F AF D8 4C 89 74 24 48 45 8D 72 FF 45 85 D2 74 ?? 48 89 6C 24 38 41 8B AB ?? ?? ?? ?? 48 89 74 24 40 49 8B B3 ?? ?? ?? ?? 66 0F 1F 44 00 00 41 8D 14 18 41 8B CE 48 23 D1 44 8B 0C D6 44 3B CD 74 ?? 44 3B C8 74 ?? 41 FF C0 45 3B C2 72 ?? 48 8B 74 24 40 48 8B 6C 24 38 48 8B 5C 24 30 4C 8B 74 24 48 0F 28 D1 8B D0 49 8B CB 48 83 C4 20 5F E9 ?? ?? ?? ??'},
+        wheel = {0x11A8490, '48 89 5C 24 18 48 89 6C 24 20 57 48 81 EC C0 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 B0 00 00 00 8B 41 08 8B EA 3B 05 ?? ?? ?? ?? 48 8B 1D ?? ?? ?? ?? 75 ?? B8 FF FF FF FF EB ?? 44 8B 4B 48 33 D2 44 8B 53 50 44 0F AF D0'},
+    }
+    local ctypes = {
+        heal = 'void (*)(void *, uint32_t, float)',
+        query = 'uint64_t (*)(uint32_t, uint32_t, void *)',
+        get = 'uint64_t (*)(uint32_t, uint32_t, void *)',
+        set = 'uint64_t (*)(uint32_t, uint32_t, void *)',
+    }
+    local functions = {}
+    pcall(ffi.cdef, 'size_t __stdcall VirtualQuery(const void *, void *, size_t);')
+    pcall(ffi.cdef, 'void * __stdcall GetModuleHandleA(const char *);')
+    local kernel_ok, kernel = pcall(ffi.load, 'kernel32')
+    local region = ffi.new('uint8_t[48]')
+    local function pointer(n) return ffi.cast('void *', ffi.cast('uintptr_t', n)) end
+    local function read(p, n) return N.win.read(p, n) end
+    local function rq(p)
+        local b = read(p, 8)
+        if not b then return nil end
+        local v = N.ptr(b, 0)
+        return v >= 65536 and v or nil
+    end
+    local function r32(p) local b = read(p, 4); return b and N.u32(b, 0) end
+    local function rb(p) local b = read(p, 1); return b and b:byte(1) end
+    local function in_module(p)
+        return type(p) == 'number' and p >= N.base and p < N.base + N.pe.size
+    end
+    local function in_engine(p)
+        return in_module(p) or (R.exe ~= nil and type(p) == 'number' and p >= R.exe.base and p < R.exe.base + R.exe.size)
+    end
+    local function resolve_exe()
+        if not kernel_ok then return nil end
+        local handle = kernel.GetModuleHandleA('helldivers2.exe')
+        if handle == nil then return nil end
+        local base = tonumber(ffi.cast('uintptr_t', handle))
+        local dos = read(base, 0x40)
+        if not dos or dos:sub(1, 2) ~= 'MZ' then return nil end
+        local offset = N.u32(dos, 0x3C)
+        if offset < 0x40 or offset > 0x1000 then return nil end
+        local pe = read(base + offset, 0x100)
+        if not pe or pe:sub(1, 4) ~= 'PE\0\0' or N.u32(pe, 4) % 65536 ~= 0x8664 or N.u32(pe, 24) % 65536 ~= 0x20B then return nil end
+        local size = N.u32(pe, 80)
+        if size < 4096 or size > 0x40000000 then return nil end
+        return {base = base, size = size}
+    end
+    local function matches(p, pattern)
+        local tokens = {}
+        for t in pattern:gmatch('%S+') do tokens[#tokens + 1] = t end
+        local b = read(p, #tokens)
+        if not b or #b ~= #tokens then return false end
+        for i, t in ipairs(tokens) do
+            if t ~= '??' and b:byte(i) ~= tonumber(t, 16) then return false end
+        end
+        return true
+    end
+    local function rel(p, displacement, length)
+        local b = read(p + displacement, 4)
+        if not b then error('unreadable relative address', 0) end
+        local target = p + length + N.i32(b, 0)
+        if not in_engine(target) then error('relative target outside game modules', 0) end
+        return target
+    end
+    local function need(ok, why) if not ok then error(why, 0) end end
+    local function resolve_heal()
+        local p = N.base + signatures.heal[1]
+        need(matches(p, signatures.heal[2]), 'repair-drone wrapper guard')
+        local root = rel(p + 9, 3, 7)
+        need(root == N.base + N.roots.health, 'repair health manager differs')
+        need(matches(p + 0xA1, 'E9 ?? ?? ?? ??'), 'repair tail jump')
+        local fn = rel(p + 0xA1, 1, 5)
+        need(matches(fn, '48 8B C4 48 89 58 10'), 'repair function prologue')
+        need(matches(fn + 0xBB, '49 8B CC') and matches(fn + 0xC2, 'E8 ?? ?? ?? ??'), 'repair config call')
+        need(matches(fn + 0xCB, '4D 69 ED B8 01 00 00'), 'repair Health record stride')
+        return {root = root, fn = fn}
+    end
+    local function resolve_wheel()
+        local p = N.base + signatures.wheel[1]
+        need(matches(p, signatures.wheel[2]), 'wheel damage function guard')
+        need(matches(p + 0xB3, '4C 8B 0D ?? ?? ?? ??'), 'wheel component query root')
+        need(matches(p + 0xBA, '4C 8D 44 24 50 8B 4B 0C BA 10 00 00 00'), 'wheel component mask 16')
+        need(matches(p + 0xCD, '48 8B 4C 24 70'), 'wheel component handle offset')
+        need(matches(p + 0xEB, '48 8B 05 ?? ?? ?? ??'), 'VehicleApi root')
+        need(matches(p + 0xFC, 'FF 50') and matches(p + 0x173, 'FF 50'), 'wheel getter/setter calls')
+        local get, set = rb(p + 0xFE), rb(p + 0x175)
+        need(get and set and get ~= set and get <= 0xF8 and set <= 0xF8 and get % 8 == 0 and set % 8 == 0, 'wheel API slots')
+        local api = rel(p + 0xEB, 3, 7)
+        need(api == rel(p + 0x114, 3, 7), 'VehicleApi roots differ')
+        return {query = rel(p + 0xB3, 3, 7), api = api, get = get, set = set}
+    end
+    function R.ensure(now)
+        if not N.ready then return false end
+        if R.base == N.base and now < R.next_check then return R.health ~= nil or R.wheels ~= nil end
+        R.base, R.next_check = N.base, now + 10
+        N.win.begin_sample()
+        local exe_ok, exe = pcall(resolve_exe)
+        R.exe = exe_ok and exe or nil
+        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel}) do
+            local ok, value = pcall(resolve)
+            R[name] = ok and value or nil
+            local status = ok and 'ok' or tostring(value)
+            if R[name .. '_status'] ~= status then
+                R[name .. '_status'] = status
+                log('repair native %s: %s', name, status)
+            end
+        end
+        return R.health ~= nil or R.wheels ~= nil
+    end
+    function R.invoke(name, p, ...)
+        need(in_engine(p) and read(p, 1), 'native function outside readable game modules')
+        need(kernel_ok and tonumber(kernel.VirtualQuery(pointer(p), region, 48)) == 48, 'native executable-page query failed')
+        local b = ffi.string(region, 48)
+        local protection = N.u32(b, 36)
+        local page = protection % 256
+        need(N.u32(b, 32) == 0x1000 and math.floor(protection / 256) % 2 == 0
+            and (page == 0x20 or page == 0x40 or page == 0x80), 'native target is not an executable page')
+        local key = name .. ':' .. tostring(p)
+        local fn = functions[key]
+        if not fn then fn = ffi.cast(ctypes[name], pointer(p)); functions[key] = fn end
+        R.calls = R.calls + 1
+        return fn(...)
+    end
+    local function owner(d)
+        local g = N.sample_graph()
+        local net, hm = g:root('network'), g:root('health')
+        g:roundtrip(net, d)
+        local i, hd = g:component(hm, d.entity, 0x1030, 0x1048)
+        need(i ~= nil and N.same(hd, d) and hd.flags % 2 == 1, 'repair requires current authoritative owner')
+        local rec = N.ptr(g:watch(hm + 0x1058, 8), 0) + i * 0x1B8
+        need(N.i32(g:read(rec + 0x14, 4), 0) > 0 and N.u32(g:read(rec + 0x19C, 4), 0) == 0, 'repair does not revive dead vehicles')
+        g:validate()
+        return hm
+    end
+    function R.heal(d, fraction)
+        if not R.health then return false, R.health_status end
+        if type(fraction) ~= 'number' or fraction ~= fraction or fraction <= 0 or fraction > 1 then return false, 'invalid repair fraction' end
+        local hm = owner(d)
+        need(rq(R.health.root) == hm, 'repair manager changed')
+        R.invoke('heal', R.health.fn, pointer(hm), d.entity, fraction)
+        return true
+    end
+    local function wheel_access(d)
+        need(R.wheels ~= nil, R.wheels_status or 'wheel interface unavailable')
+        owner(d)
+        local query_table = rq(R.wheels.query)
+        local query = query_table and rq(query_table)
+        need(query and in_engine(query), 'wheel query function unavailable')
+        local buffer = ffi.new('uint8_t[128]')
+        R.invoke('query', query, d.unit, 16, buffer)
+        local handle_ptr = N.ptr(ffi.string(buffer, 128), 0x20)
+        need(handle_ptr >= 65536, 'vehicle handle unavailable')
+        local h = r32(handle_ptr)
+        need(h and h ~= 0xFFFFFFFF, 'invalid vehicle handle')
+        local api = rq(R.wheels.api)
+        local get = api and rq(api + R.wheels.get)
+        local set = api and rq(api + R.wheels.set)
+        need(get and set and in_engine(get) and in_engine(set), 'wheel API functions unavailable')
+        need(matches(get, '48 89 5C 24 08 57 48 83 EC 30 8B C1 4C 8D 0D'), 'wheel getter guard')
+        local table_root = rel(get + 0x0C, 3, 7)
+        local table_ptr = rq(table_root + math.floor(h / 0x40000000) * 8)
+        local b = table_ptr and read(table_ptr, 0x38)
+        need(b, 'wheel handle table unreadable')
+        local base, desc = N.ptr(b, 0), N.u32(b, 0x1C)
+        local limit, mask, check = N.u32(b, 0x24), N.u32(b, 0x28), N.u32(b, 0x34)
+        local bit = require('bit')
+        local index = bit.band(h, mask) % U32
+        need(base >= 65536 and index < limit and bit.band(h, check) ~= 0, 'stale wheel handle')
+        local stride = desc % 65536
+        need(stride >= 0x28 and stride < 0x10000, 'wheel handle stride')
+        local entry = base + index * stride
+        need(r32(entry + math.floor(desc / 65536) % 256) == h, 'wheel handle generation changed')
+        local resource = rq(entry + math.floor(desc / 16777216) + 0x20)
+        local offset = resource and r32(resource + 0x0C)
+        need(offset and offset < 0x1000000, 'wheel resource header offset')
+        local header = resource + offset
+        need(r32(header) == 0x20575256 and r32(header + 4) == 4, 'FRV wheel resource must contain four wheels')
+        return {h = h, get = get, set = set}
+    end
+    local function get_wheel(a, index)
+        local b = ffi.new('uint8_t[48]')
+        if tonumber(R.invoke('get', a.get, a.h, index, b)) == 0 then return nil end
+        local s = ffi.string(b, 48)
+        return s:byte(0x29) <= 1 and s or nil
+    end
+    -- Health zone indices and VehicleApi wheel indices are different namespaces.
+    -- Learn only unambiguous simultaneous damage, never infer an index from its name/order.
+    function R.observe_damage(d, zones, data)
+        if not R.wheels then return end
+        local key = d.entity .. ':' .. d.goid .. ':' .. d.unit .. ':' .. d.resource
+        local a, broken, flags = wheel_access(d), {}, {}
+        for i = 0, 3 do
+            local z = zones[i + 1]
+            if not z or z.i ~= i or z.hash ~= wheel_names[i + 1] then return end
+            local hp = N.i32(data, 0xF8 + i * 4)
+            local bits = math.floor(N.u32(data, 0x20) / 4 ^ i) % 4
+            broken[i] = (hp <= 0 and hp > -1000000) or bits == 2
+            local s = get_wheel(a, i)
+            if not s then return end
+            flags[i] = s:byte(0x29) == 1
+        end
+        local old = R.observations[key]
+        R.observations[key] = {broken = broken, flags = flags}
+        local function unique(values, previous)
+            local found
+            for i = 0, 3 do
+                if values[i] and (not previous or not previous[i]) then
+                    if found ~= nil then return nil end
+                    found = i
+                end
+            end
+            return found
+        end
+        local zone, index = unique(broken, old and old.broken), unique(flags, old and old.flags)
+        if zone == nil or index == nil then return end
+        local map = R.maps[d.resource] or {}
+        local hash = wheel_names[zone + 1]
+        local conflict = map[index] and map[index] ~= hash
+        for i, name in pairs(map) do if i ~= index and name == hash then conflict = true end end
+        if conflict then
+            R.maps[d.resource] = nil
+            log('wheel mapping reset %s: contradictory damage observations', d.resource)
+            return
+        end
+        if not map[index] then
+            map[index] = hash; R.maps[d.resource] = map
+            log('wheel mapping learned %s api_index=%d zone=%s (isolated damage)', d.resource, index, hash)
+        end
+    end
+    function R.allowed(d, selected)
+        local all, none = true, true
+        for _, hash in ipairs(wheel_names) do
+            if selected[hash] then none = false else all = false end
+        end
+        local allowed, map = {}, R.maps[d.resource] or {}
+        for i = 0, 3 do allowed[i] = all or (not none and map[i] ~= nil and selected[map[i]] == true) end
+        return allowed, not all and not none
+    end
+    function R.learn(d)
+        if not R.wheels then return false, R.wheels_status end
+        local c = R.cache[d.resource]
+        if c and c.complete then return true end
+        local a = wheel_access(d)
+        c = c or {}; R.cache[d.resource] = c
+        local count = 0
+        for i = 0, 3 do
+            if not c[i] then
+                local sample = get_wheel(a, i)
+                if sample and sample:byte(0x29) == 0 then
+                    c[i] = sample
+                    log('wheel learned %s index=%d (VehicleApi, 48 bytes)', d.resource, i)
+                end
+            end
+            if c[i] then count = count + 1 end
+        end
+        c.complete = count == 4
+        return true
+    end
+    function R.repair_wheel(d, allowed)
+        if not R.wheels then return false, R.wheels_status end
+        local c = R.cache[d.resource]
+        if not c then return false, 'no intact tyre sample; spawn an intact FRV of the same type' end
+        local a = wheel_access(d)
+        local missing = false
+        for i = 0, 3 do
+            if allowed[i] then
+                local current = get_wheel(a, i)
+                if current and current:byte(0x29) == 1 then
+                    if c[i] then
+                        local buffer = ffi.new('uint8_t[48]')
+                        ffi.copy(buffer, c[i], 48)
+                        buffer[0x28] = 0
+                        -- Revalidate ownership and query again immediately before mutation.
+                        local fresh = wheel_access(d)
+                        need(fresh.h == a.h and fresh.set == a.set, 'wheel interface changed before repair')
+                        R.invoke('set', fresh.set, fresh.h, i, buffer)
+                        local back = get_wheel(fresh, i)
+                        if not back or back:byte(0x29) ~= 0 then return false, 'tyre setter readback failed' end
+                        R.fixed = R.fixed + 1
+                        log('wheel repaired %s ent=%d index=%d flag=1->0 (mobility; model not rebuilt)', d.resource, d.entity, i)
+                        return true
+                    end
+                    missing = true
+                end
+            end
+        end
+        return false, missing and 'missing intact sample for damaged wheel' or 'no selected blown tyre'
+    end
+    function R.reset() R.cache, R.maps, R.observations = {}, {}, {}; functions = {} end
+    R.signatures = signatures -- read-only metadata used by offline guard tests
+    return R
+end
+
+end)()
 -- ===========================================================================
 -- Shield Vehicle Resupply — main body
 -- 读取层来自 DRIVER HUD / HUD（上面拼接进来的 N），这里只加了：
@@ -539,14 +841,16 @@ local C = {
     cooldown       = 2.0,    -- 受伤后多少秒内不回复
     revive         = false,  -- 修复被打爆（HP≤0）的部位（数据能回来，但模型不会恢复，默认关）
     shield_duration = 45,    -- 护盾最长持续时间（秒，wiki：FX-12 40 秒 + 展开时间）。生成器实体消失也立即结束。0 = 不限时
-    tires          = false,  -- FRV 爆胎修复（实验性）
+    tires          = true,   -- FRV：用 VehicleApi 恢复完好轮胎参数和爆胎标志；模型不重建
+    wheel_interval = 2.0,    -- 每辆 FRV 至多每隔这些秒修一个轮胎
+    part_repair    = true,   -- 调用游戏维修函数处理已毁部位；整车接口要求所有部位均未禁用
     net_heal       = true,   -- 用引擎 set_game_object_field 给坦克/FRV 车体（HUD 显示的网络血量）回血（v0.8b 实测 FRV 可行）
     hull_zones     = true,   -- 坦克/FRV：被打爆部位的 HP 数值也回满（模型不变），车体血量才会回（v0.8 推断：车体 = 上限 - 各部位损失）
     authority_only = true,   -- 只改本机有权威的组件（descriptor flags bit0）
     heal           = 'native', -- v0.13：native = 用游戏自带的回血（写 HealthComponent 配置；不扫内存）
                                --        write  = 旧的逐帧写血量（没有扫描，用来对照/兜底）
                                --        off    = 完全不回血（诊断用）
-    native_zone    = 0x13D,  -- filediver 布局：部位 RegenerationEnabled；逐部位校验后才写。0 = 保留旧路径
+    native_zone    = 0x141,  -- filediver 二进制类型表：RegenerationEnabled；逐部位校验后才写。0 = 保留旧路径
     part_regen     = true,   -- 原生部位再生默认开关；part=<资源hash>:<部位hash>=0|1 可逐部位覆盖
     part           = {},     -- 按资源 + 部位 hash 选取；不依赖不同车型的部位数组顺序
     native_segments = 1,     -- v0.13：RegenerationSegments（回血段数）
@@ -606,6 +910,7 @@ local AMMO_SPEC = {
 -- 坦克武器实体 goid = 车体 goid - n（Bastion 来自 DRIVER HUD；Maelstrom 为游戏内实测），只用来确定归属
 local TANK_WEAPON_GOIDS = { ['16474112801385b6'] = { 2, 1 }, ['b0c9faf4af8903f9'] = { 5, 3, 2, 1 } }
 local WHEEL = { fed0a478 = true, f3cb00ad = true, c6bf05a9 = true, f12186b7 = true }
+local WHEEL_NAME = { fed0a478 = 'front_left', f3cb00ad = 'front_right', c6bf05a9 = 'rear_left', f12186b7 = 'rear_right' }
 local HEAL_RATE = { exo = 'exo_heal', arm = 'exo_heal', tank = 'tank_heal', frv = 'frv_heal' }
 local AMMO_KIND = { exo = true, arm = true, tank = true }  -- FRV 不补弹
 
@@ -628,6 +933,7 @@ local function log(fmt, ...)
     local f = io.open(LOG, 'a')
     if f then f:write(os.date('%H:%M:%S '), ok and s or fmt, '\n'); f:close() end
 end
+local REPAIR = RepairNative(N, log)
 
 local stage_seen = {}
 local function stage(name)
@@ -658,8 +964,8 @@ local function read_settings()
         if f then
             f:write('# Shield Vehicle Resupply 设置。改完在 shield_resupply_cmd.txt 写 reload\n',
                 '# shield=<16位hex> 可写多行；weapon=<hex> 同理；ammo_max=<hex>:<字段>=<数值>\n',
-                'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=0\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
-                'ammo_rate=0.10\ncooldown=2\nauthority_only=1\nheal=native\nnative_zone=0x13d\npart_regen=1\nnative_segments=1\nnative_force=1\n',
+                'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=1\nwheel_interval=2\npart_repair=1\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
+                'ammo_rate=0.10\ncooldown=2\nauthority_only=1\nheal=native\nnative_zone=0x141\npart_regen=1\nnative_segments=1\nnative_force=1\n',
                 '# part=<16位资源hash>:<8位部位hash>=0|1，可写多行；parts 命令列出这些 hash\n')
             f:close()
         end
@@ -689,6 +995,10 @@ local function read_settings()
         elseif k and type(C[k]) == 'number' and tonumber(v) then C[k] = tonumber(v) end
     end
     f:close()
+    if C.native_zone == 0x13D then
+        C.native_zone = 0x141
+        log('settings: v0.14 的 native_zone=0x13d 推导有误，已迁移到二进制类型表确认的 +141')
+    end
     local n = 0; for _ in pairs(C.shield) do n = n + 1 end
     log('settings: radius=%.1f heal=%s native_zone=%s test=%s revive=%s hull_zones=%s tires=%s ammo=%s shields=%d',
         C.radius, C.heal, C.native_zone > 0 and string.format('+%x', C.native_zone) or 'off', tostring(C.test), tostring(C.revive), tostring(C.hull_zones), tostring(C.tires), tostring(C.ammo), n)
@@ -830,6 +1140,8 @@ local function reset_context()
     S.last_total, S.last_hit, S.frac, S.ammo_max, S.reported, S.next_roster = {}, {}, {}, {}, {}, 0
     S.shield_born, S.shield_expired, S.vstate, S.want_units = {}, {}, {}, nil
     S.hptrace = nil
+    S.wheel_trace, S.next_wheel_learn = nil, 0
+    REPAIR.reset()
 end
 
 
@@ -1293,7 +1605,8 @@ local CFG = {
     health = 0x00, rate = 0x04, disabled = 0x08, cooldown = 0x0C,
     segments = 0x10, regen_rate = 0x14,
     zones = 0x208, zone_stride = 0x228, zone_name = 0x60, zone_health = 0xE8, zone_info = 0x1C8,
-    zone_regen = 0x13D, zone_heal_event = 0xA8, zone_disable_actors = 0x148,
+    zone_regen = 0x141, zone_heal_event = 0xAC, zone_disable_actors = 0x14C,
+    zone_dead_animation = 0x68,
 }
 local CFG_ON = {}   -- [配置地址] = { orig/wrote = 4 字节原值/我们写的值, users = 本轮罩子里的载具数 }
 
@@ -1348,12 +1661,12 @@ local function part_enabled(res, hash)
     return C.part_regen
 end
 
--- +0xE8 Health -> Constitution -> 5 个 bool + padding -> AffectsMainHealth
--- -> ChildZones[16] -> KillChildrenOnDeath -> RegenerationEnabled (+0x13D)。
--- 来源：https://github.com/xypwn/filediver/blob/master/datalibrary/health_component.go
+-- 以 dl_library.dl_typelib.gz 的 64 位成员偏移为准。Go 的手写结构漏了字段，
+-- v0.14 据此误推 +13D（实际在 ChildZones 内）；+158 是枚举，不是 bool。
+-- 来源：https://github.com/xypwn/filediver/blob/master/datalibrary/dl_library.dl_typelib.gz
 -- 0/1 字节本身不能证明布局；同时核对已确认的名字/上限、邻近字段与子部位引用。
 local function zone_layout(cfg, z, zc, off)
-    if off ~= CFG.zone_regen then return nil, 'unsupported offset (expected +13d)' end
+    if off ~= CFG.zone_regen then return nil, 'unsupported offset (expected +141)' end
     local base = cfg + CFG.zones + z.i * CFG.zone_stride
     local b = N.win.read(base + CFG.zone_name, CFG.zone_info - CFG.zone_name)
     if type(b) ~= 'string' or #b ~= CFG.zone_info - CFG.zone_name then return nil, 'unreadable' end
@@ -1364,19 +1677,21 @@ local function zone_layout(cfg, z, zc, off)
     if max ~= z.max then return nil, 'zone max changed' end
     local constitution = i32(b, at(0xEC))
     if constitution < 0 or constitution > 10000000 then return nil, 'constitution' end
-    for _, o in ipairs({0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0x13C, 0x13D, 0x13E, 0x13F, 0x148, 0x149, 0x150, 0x158}) do
+    for _, o in ipairs({0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0x140, 0x141, 0x142, 0x143, 0x14C, 0x14D, 0x14E, 0x154, 0x15C}) do
         if b:byte(at(o) + 1) > 1 then return nil, string.format('bool +%x', o) end
     end
     local affects = f32_at(b, at(0xF8))
     if not finite_pos(affects) or affects > 1 then return nil, 'main health multiplier' end
     local names = {}
     for _, child in ipairs(zc.zones) do names[tonumber(child.hash, 16)] = true end
-    for o = 0xFC, 0x138, 4 do
+    for o = 0x100, 0x13C, 4 do
         local child = u32(b, at(o))
         if child ~= 0 and not names[child] then return nil, 'unknown child zone' end
     end
-    if not finite_pos(f32_at(b, at(0x140))) or not finite_pos(f32_at(b, at(0x144)))
-        or u32(b, at(0x14C)) > 4096 then return nil, 'zone tail layout' end
+    -- FRV body zones use FLT_MAX at +144 as a valid sentinel; HP-rate limits do not apply here.
+    local f1, f2 = f32_at(b, at(0x144)), f32_at(b, at(0x148))
+    if f1 ~= f1 or f1 < 0 or f1 == math.huge or f2 ~= f2 or f2 < 0 or f2 == math.huge
+        or u32(b, at(0x150)) > 4096 or u32(b, at(0x158)) > 4096 then return nil, 'zone tail layout' end
     return b:sub(at(off) + 1, at(off) + 1)
 end
 
@@ -1543,6 +1858,97 @@ local function read_record(v)
     return rec, data, zc, hd, cfg
 end
 
+-- 仅在护盾服务时记录 FRV 四轮的状态变化，避免必须手动抢在护盾结束前发命令。
+-- death_ability 是 filediver 名称库中的线索，不作为 TagComponent 位掩码写入。
+local function trace_wheels(v, data, zc, cfg, native_zones)
+    if v.kind ~= 'frv' then return end
+    if C.tires and REPAIR.wheels then
+        local ok, why = pcall(REPAIR.observe_damage, v.d, zc.zones, data)
+        local report = 'wm' .. v.d.resource .. tostring(why)
+        if not ok and not S.reported[report] then S.reported[report] = true; log('wheel mapping skip %s: %s', v.d.resource, tostring(why)) end
+    end
+    S.wheel_trace = S.wheel_trace or {}
+    local key = v.d.entity .. ':' .. v.d.goid .. ':' .. v.d.resource
+    local seen = S.wheel_trace[key] or { next_t = 0 }
+    S.wheel_trace[key] = seen
+    if S.clock < seen.next_t then return end
+    seen.next_t = S.clock + 2
+    for _, z in ipairs(zc.zones) do
+        local name = WHEEL_NAME[z.hash]
+        if name then
+            local hp = i32(data, 0xF8 + 4 * z.i)
+            local bits = z.i < 16 and tostring(math.floor(u32(data, 0x20) / 4 ^ z.i) % 4) or '?'
+            local active = native_zones[z.i] == true
+            local value = tostring(hp) .. ':' .. bits .. ':' .. tostring(active)
+            if seen[z.hash] ~= value then
+                seen[z.hash] = value
+                local base = cfg + CFG.zones + z.i * CFG.zone_stride
+                local anim = N.win.read(base + CFG.zone_dead_animation, 4)
+                local event = N.win.read(base + CFG.zone_heal_event, 4)
+                local actors = N.win.read(base + CFG.zone_disable_actors, 1)
+                log('wheel %s ent=%d zone=%s hp=%d/%d state=%s native=%s dead_anim=%s heal_event=%s disable_actors=%s death_ability=AbilityId_vehicle_%s_wheel_dead',
+                    name, v.d.entity, z.hash, hp, z.max, bits, tostring(active),
+                    anim and string.format('%08x', u32(anim, 0)) or '?',
+                    event and string.format('%08x', u32(event, 0)) or '?', actors and tostring(actors:byte(1)) or '?', name)
+            end
+        end
+    end
+end
+
+local function repair_destroyed(v, zones, data, rate, dt, key)
+    if rate <= 0 then return 0 end
+    local d, changed = v.d, 0
+    local function report(prefix, reason)
+        local report_key = prefix .. key .. reason
+        if not S.reported[report_key] then
+            S.reported[report_key] = true
+            log('%s %s ent=%d: %s', prefix, v.kind, d.entity, reason)
+        end
+    end
+    if C.part_repair then
+        local damaged, all_selected = false, true
+        for _, z in ipairs(zones) do
+            if z.max > 0 then
+                if not part_enabled(d.resource, z.hash) then all_selected = false end
+                local bits = z.i < 16 and math.floor(u32(data, 0x20) / 4 ^ z.i) % 4 or 0
+                if (z.hp <= 0 and z.hp > -1000000) or bits == 2 then damaged = true end
+            end
+        end
+        if damaged and all_selected then
+            local ok, done, why = pcall(REPAIR.heal, d, math.min(1, rate * dt))
+            if ok and done then
+                changed = changed + 1
+                report('part repair', 'game repair function')
+            else report('part repair skip', tostring(ok and why or done)) end
+        elseif damaged and not all_selected then
+            report('part repair skip', 'a part is disabled; game repair function affects all zones')
+        end
+    end
+    if C.tires and v.kind == 'frv' and S.clock >= (v.next_wheel or 0) then
+        v.next_wheel = S.clock + math.max(0.5, C.wheel_interval)
+        local expected = {'fed0a478', 'f3cb00ad', 'c6bf05a9', 'f12186b7'}
+        local selected, mapped = {}, true
+        for i = 0, 3 do
+            local z = zones[i + 1]
+            if not z or z.i ~= i or z.hash ~= expected[i + 1] then mapped = false; break end
+            selected[z.hash] = part_enabled(d.resource, z.hash)
+        end
+        local ok, done, why
+        if mapped then
+            local allowed, partial = REPAIR.allowed(d, selected)
+            ok, done, why = pcall(REPAIR.repair_wheel, d, allowed)
+            if ok and not done and partial and why == 'no selected blown tyre' then
+                why = 'no selected blown tyre with a confirmed API/health mapping; damage one tyre at a time to learn'
+            end
+        else ok, done, why = true, false, 'FRV wheel zone order is not recognized' end
+        if ok and done then changed = changed + 1
+        elseif not ok or (why and why ~= 'no selected blown tyre') then
+            report('wheel repair skip', tostring(ok and why or done))
+        end
+    end
+    return changed
+end
+
 local function heal(v, dt)
     if C.heal == 'off' then return 'heal off' end
     local d = v.d
@@ -1564,6 +1970,7 @@ local function heal(v, dt)
         local _, active = native_apply(v, cfg, mx, mx * rate, zc)
         native_zones = active or {}
     end
+    trace_wheels(v, data, zc, cfg, native_zones)
 
     -- 受伤检测（总血量下降 -> 冷却）
     local total = hp
@@ -1573,7 +1980,7 @@ local function heal(v, dt)
     S.last_total[key] = total
     if C.cooldown > 0 and S.last_hit[key] and S.clock - S.last_hit[key] < C.cooldown then return 'cooldown' end
 
-    local changed = 0
+    local changed = repair_destroyed(v, zones, data, rate, dt, key)
     if C.heal == 'write' and hp < mx then  -- native 模式下主血量由游戏负责，mod 不写
         local n = amount(key .. ':h', mx, rate, dt)
         if n > 0 and W.i32(rec + 0x14, hp, math.min(mx, hp + n)) then changed = changed + 1 end
@@ -1599,7 +2006,7 @@ local function heal(v, dt)
                         log('hull zone %s entity=%d zone=%s from %d (state kept)', v.kind, d.entity, z.hash, z.hp)
                     end
                 end
-            elseif z.hp > -1000000 and ((v.kind == 'frv' and WHEEL[z.hash] and C.tires) or (not WHEEL[z.hash] and C.revive)) then
+            elseif z.hp > -1000000 and not WHEEL[z.hash] and C.revive then
                 -- 被打爆的部位（HP≤0）：拉回 25%，并清掉该区的 2-bit 损坏状态（2=已摧毁，游戏内实测）
                 -- 之后按正常速度继续回满。实验性：模型/脱落的部件能否恢复取决于游戏
                 if W.i32(rec + zo, z.hp, math.ceil(z.max * 0.25)) then
@@ -1752,12 +2159,14 @@ local function cmd_parts()
                 local base = cfg + CFG.zones + z.i * CFG.zone_stride
                 local event = N.win.read(base + CFG.zone_heal_event, 4)
                 local actors = N.win.read(base + CFG.zone_disable_actors, 1)
+                local anim = N.win.read(base + CFG.zone_dead_animation, 4)
                 local bits = z.i < 16 and tostring(math.floor(u32(data, 0x20) / 4 ^ z.i) % 4) or '?'
-                log('part %s ent=%d i=%d %s hp=%d/%d state=%s requested=%s regen=%s auth=%s heal_event=%s disable_actors=%s%s',
+                log('part %s ent=%d i=%d %s hp=%d/%d state=%s requested=%s regen=%s auth=%s heal_event=%s disable_actors=%s dead_anim=%s%s',
                     v.kind, v.d.entity, z.i, v.d.resource .. ':' .. z.hash, i32(data, 0xF8 + 4 * z.i), z.max,
                     bits, tostring(part_enabled(v.d.resource, z.hash)), cur and tostring(cur:byte(1)) or '?',
                     tostring(hd.flags % 2 == 1), cur and event and string.format('%08x', u32(event, 0)) or '?',
-                    cur and actors and tostring(actors:byte(1)) or '?', why and (' layout=' .. why) or '')
+                    cur and actors and tostring(actors:byte(1)) or '?',
+                    cur and anim and string.format('%08x', u32(anim, 0)) or '?', why and (' layout=' .. why) or '')
             end
         end)
         if not ok then log('parts %s %s: %s', v.kind, v.d.resource, tostring(err)) end
@@ -2073,6 +2482,7 @@ local function tick(dt)
         return
     end
     stage('native layout ok')
+    if C.enabled and (C.tires or C.part_repair) then REPAIR.ensure(S.clock) end
     if N.weapon_base ~= N.base then
         N.weapon_base = N.base
         N.win.begin_sample()
@@ -2118,6 +2528,19 @@ local function tick(dt)
             else S.seen_ent = nil end
         else log('net roster: %s', tostring(list)) end
         -- 弹药上限的“观察”已在 rebuild_roster 里批量完成（observe_ammo）
+    end
+    if C.enabled and C.tires and REPAIR.wheels and S.clock >= (S.next_wheel_learn or 0) then
+        S.next_wheel_learn = S.clock + 1
+        for _, v in ipairs(S.vehicles) do
+            if v.kind == 'frv' then
+                local ok, done, why = pcall(REPAIR.learn, v.d)
+                if not ok or (not done and why) then
+                    local reason = tostring(ok and why or done)
+                    local report = 'wl' .. v.d.resource .. reason
+                    if not S.reported[report] then S.reported[report] = true; log('wheel learn skip %s: %s', v.d.resource, reason) end
+                end
+            end
+        end
     end
     if S.hptrace then  -- v0.13 诊断：看不用 mod 写血量时，血量会不会自己涨
         local t = S.hptrace
@@ -2203,7 +2626,7 @@ local function tick(dt)
 end
 
 load_settings()
-if TEST_HOOK then TEST_HOOK(N, W, S, C) end
+if TEST_HOOK then TEST_HOOK(N, W, S, C, REPAIR) end
 local previous = rawget(_G, 'update')
 rawset(_G, 'update', function(dt, ...)
     if type(dt) == 'number' and dt > 0 and dt < 1 then
@@ -2215,5 +2638,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.14 (逐部位原生再生；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.15 (游戏维修函数与 VehicleApi 爆胎修复；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }
