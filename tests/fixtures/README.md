@@ -72,3 +72,12 @@ read-only game.dll capture for the StopEffect wrapper, callee and config getter.
 Every span also matched the current process at 05:41. Tests mock the native
 effect call and its engine-managed handle cleanup; they prove guarded selection
 and retries, not that visible flames disappear in the game.
+
+`exo55_effect_table_live_v0.24.bin`, `exo55_effect_live_v0.24.bin` and
+`exo55_effect_lookup_live_v0.24.json` were captured with VM_READ from PID 4944
+at 05:49:42 on 2026-10-01. The table is 0x5600 bytes: 0x560 (1376) entries,
+each 16 bytes. EXO-55 occupies slot 676 and uses config index 511. Its runtime
+0xF48-byte config equals the earlier public filediver record byte for byte.
+The test now replays this table and index directly: v0.23 incorrectly used
+1360 for both the implementation and synthetic fixture, hiding a real-game
+lookup failure. The native effect call remains mocked.

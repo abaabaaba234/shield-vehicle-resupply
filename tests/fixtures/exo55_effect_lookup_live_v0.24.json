@@ -1,0 +1,65 @@
+{
+  "captured_at": "2026-10-01T05:49:42.104170",
+  "pid": 4944,
+  "count_hex": "0x560",
+  "count": 1376,
+  "expected_slot": 676,
+  "wrong_1360_slot": 628,
+  "hits": [
+    {
+      "slot": 676,
+      "index": 511,
+      "effects": [
+        {
+          "slot": 0,
+          "name": "579c6bf5",
+          "particle": "5c15c15e8b3a9636",
+          "node": "4d1af986",
+          "stop": 2
+        },
+        {
+          "slot": 1,
+          "name": "c8243257",
+          "particle": "da8ff259e04c4f45",
+          "node": "4d1af986",
+          "stop": 2
+        },
+        {
+          "slot": 2,
+          "name": "6821515b",
+          "particle": "f8eecda3b2520b2c",
+          "node": "d47843d2",
+          "stop": 2
+        },
+        {
+          "slot": 3,
+          "name": "e31b8705",
+          "particle": "1b9236a0c8137ed1",
+          "node": "d47843d2",
+          "stop": 2
+        },
+        {
+          "slot": 4,
+          "name": "a1d3345e",
+          "particle": "1b9236a0c8137ed1",
+          "node": "2b57c939",
+          "stop": 2
+        },
+        {
+          "slot": 5,
+          "name": "4a3fa896",
+          "particle": "1b9236a0c8137ed1",
+          "node": "a5bfa032",
+          "stop": 2
+        },
+        {
+          "slot": 6,
+          "name": "3b8e9e9a",
+          "particle": "db28785c05c69a20",
+          "node": "51c902bf",
+          "stop": 2
+        }
+      ]
+    }
+  ]
+}

@@ -13,7 +13,9 @@ exec(compile(source.split('\nmem, lua, cfg, rec, logs = fixture()', 1)[0], 'exo-
 fixture, run, maps, Q, U, I, F, BASE, ROWS = (ns[k] for k in ('fixture', 'run', 'maps', 'Q', 'U', 'I', 'F', 'BASE', 'ROWS'))
 EXO55 = '35dbf54f016f3624'
 FXROOT, FX, FENTRIES, FOWNERS, FROWS, SETTINGS = BASE + 0x3326570, 0x58000000, 0x58001000, 0x58002000, 0x58003000, 0x59000000
-ECFG = SETTINGS + 0x5600 + 2 * 0xf48
+LOOKUP = json.loads((ROOT / 'tests/fixtures/exo55_effect_lookup_live_v0.24.json').read_text())
+assert LOOKUP['count'] == 0x560 == 1376 and LOOKUP['hits'][0]['slot'] == 676
+ECFG = SETTINGS + 0x5600 + LOOKUP['hits'][0]['index'] * 0xf48
 DESC = 0x20000000 + 0xf32f18
 CODE = json.loads((ROOT / 'tests/fixtures/exo_leg_effect_native_v0.23.json').read_text())['spans']
 
@@ -38,9 +40,10 @@ def make():
     mem.w(FROWS + 4 * 4, U(18347)); mem.w(FROWS + 0x218 + 4 * 4, U(22222))
     mem.w(FROWS + 3 * 4, U(33333))
     mem.w(0x20000000 + 0xf127b8, Q(SETTINGS))
-    mem.w(SETTINGS, bytes(1360 * 16))
-    mem.w(SETTINGS + int(EXO55, 16) % 1360 * 16, Q(int(EXO55, 16)) + U(2) + U(0))
-    mem.w(ECFG, (ROOT / 'tests/fixtures/exo55_effect_reference_filediver.bin').read_bytes())
+    # Replay the actual runtime table and its native index, rather than
+    # constructing a table using the same arithmetic as the implementation.
+    mem.w(SETTINGS, (ROOT / 'tests/fixtures/exo55_effect_table_live_v0.24.bin').read_bytes())
+    mem.w(ECFG, (ROOT / 'tests/fixtures/exo55_effect_live_v0.24.bin').read_bytes())
     r = lua.eval(b'SVR.R'); r.next_check = 0
     assert r.ensure(3) and r.effects is not None, r.effects_status
     lua.execute(b'''
@@ -112,7 +115,7 @@ for why in ('damaged leg', 'damaged small zone', 'damaged hull', 'destroyed stat
     elif why == 'wrong node': mem.w(ECFG + 8 + 4*80 + 32, U(42))
     elif why == 'wrong strategy': mem.w(ECFG + 8 + 4*80 + 68, U(1))
     elif why == 'duplicate name': mem.w(ECFG + 8 + 5*80 + 48, U(0xa1d3345e))
-    elif why == 'missing settings': mem.w(SETTINGS + int(EXO55,16) % 1360 * 16, bytes(16))
+    elif why == 'missing settings': mem.w(SETTINGS + LOOKUP['hits'][0]['slot'] * 16, bytes(16))
     elif why == 'missing row': maps(mem, FX + 0x20, FENTRIES, [])
     run(lua)
     assert lua.eval(b'sim_effect_calls') == 0 and hp(mem, FROWS + 16) == 18347, why
@@ -127,7 +130,7 @@ for why in ('rows moved', 'owner moved', 'effect config moved', 'new damage', 'a
             injected[0] = True
             if why == 'rows moved': mem.w(FX + 0x48, Q(FROWS + 0x1000))
             elif why == 'owner moved': mem.w(FOWNERS, Q(DESC + 24))
-            elif why == 'effect config moved': mem.w(SETTINGS + int(EXO55,16) % 1360 * 16 + 8, U(3))
+            elif why == 'effect config moved': mem.w(SETTINGS + LOOKUP['hits'][0]['slot'] * 16 + 8, U(3))
             elif why == 'new damage': mem.w(rec + 0xf8 + 5*4, I(100))
             elif why == 'authority changed': mem.w(DESC + 20, U(0))
         return original(int(a), int(n))

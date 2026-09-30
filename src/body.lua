@@ -1981,5 +1981,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.23 (机甲小血池累计维修；修满后恢复移速并停止腿部燃烧特效；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.24 (修正原生特效资源表容量；修满后恢复移速并停止腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

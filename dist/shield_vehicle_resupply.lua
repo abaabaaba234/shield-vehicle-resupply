@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply
--- Shield Vehicle Resupply v0.23
+-- Shield Vehicle Resupply v0.24
 -- Native read layer: DRIVER HUD 1.4.5 / HUD 1.11.1, Copyright (c) 2026 FireScallion, MIT License
 -- (see third_party/LICENSE-DRIVER-HUD.txt). Writes are added by this mod.
 local N=(function()
@@ -836,13 +836,15 @@ return function(N, log)
         local rows = N.ptr(g:watch(manager + fx.rows, 8), 0) + row * fx.stride
         local net = g:root('network')
         local settings = N.ptr(g:watch(net + 0xF127B8, 8), 0)
-        local start, ecfg = N.mod64hex(d.resource, 1360), nil
+        -- Keep the native constant: 0x560 is 1376 (not 1360).
+        local count = 0x560
+        local start, ecfg = N.mod64hex(d.resource, count), nil
         for step = 0, 63 do
-            local entry = g:watch(settings + ((start + step) % 1360) * 16, 16)
+            local entry = g:watch(settings + ((start + step) % count) * 16, 16)
             local resource = N.hex64(entry, 0)
             if resource == d.resource then
                 local index = N.u32(entry, 8)
-                need(index < 1360, 'EffectReference settings index')
+                need(index < count, 'EffectReference settings index')
                 ecfg = settings + 0x5600 + index * 0xF48; break
             elseif resource == '0000000000000000' then break end
         end
@@ -3633,5 +3635,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.23 (机甲小血池累计维修；修满后恢复移速并停止腿部燃烧特效；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.24 (修正原生特效资源表容量；修满后恢复移速并停止腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }
