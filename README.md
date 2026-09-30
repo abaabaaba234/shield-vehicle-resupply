@@ -35,7 +35,9 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
 | `cooldown` | 2 | 受伤后多少秒内不回复 |
 | `net_heal` | 1 | 坦克/FRV 车体血量（HUD 显示的网络血量）回复 |
 | `heal` | native | `native` = 用游戏自带的回血开关回血（写 HealthComponent 配置，不扫内存）；`write` = 旧的逐帧写血量（用来对照/兜底）；`off` = 不回血 |
-| `native_zone` | 0 | 部位回血开关 `RegenerationEnabled` 的字节偏移（十六进制，例如 `0x13d`）。0 = 关，偏移要先用 `healcfg` 在游戏里确认 |
+| `native_zone` | 0x13d | 部位 `RegenerationEnabled` 的偏移，按 filediver 布局和已确认锚点推导，逐部位校验后才写；0 = 保留旧的部位回填路径。其他偏移只诊断、不写 |
+| `part_regen` | 1 | 部位维修默认开关（包括 HP≤0 的部位）；原生模式交给游戏再生，模型/物理恢复仍需实测 |
+| `part=` | — | 独立覆盖某个车型的部位，例如 `part=35dbf54f016f3624:ca47a7a9=0`。用 `parts` 查 hash，可写多行；禁用的部位也不会被旧路径回填 |
 | `native_segments` / `native_force` | 1 / 1 | 回血段数 / 配置页只读时临时改页保护再写 |
 | `hull_zones` | 1 | 坦克/FRV 被打爆部位的 HP 数值也回满（外观不恢复） |
 | `authority_only` | 1 | 只改本机有权威的组件（游戏自带回血也只给这类载具打开） |
@@ -53,6 +55,7 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
 | `on` / `off` / `reload` | 开 / 关 / 重新读取设置 |
 | `test` | 切换测试模式（在单人私人任务里用） |
 | `vehicles` / `weapons` | 列出载具血量 / 已关联的武器弹药 |
+| `parts` | 列出每个部位的配置键、HP、再生开关、布局检查、OnHeal 事件和死亡时禁用 actor 的标志 |
 | `units` / `recent [n]` | 统计网络实体 / 列出最新 n 个实体（找资源 hash 用） |
 | `healcfg` | 打印每种载具的 HealthComponent 配置头、部位回血开关的候选偏移，并把整段配置记录导出成文件 |
 | `hptrace [秒]` | 每 0.5 秒记一次主血量 / 部位和 / 开关状态，用来看血是不是游戏自己在涨 |
@@ -68,7 +71,8 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
     `HeathChangerate` / `RegenerationChangerate` = 每秒回血量、`HeathChangerateCooldown` = `cooldown`），
     让游戏自己的血量系统回血。写前先检查配置头像不像 `HealthComponent`，不像就一个字节都不写；
     载具离开罩子、护盾结束、关掉 mod 时写回原值。
-  - Health 部位 / 弹药组件：在进程内调用 `WriteProcessMemory`。只写 `PAGE_READWRITE` 页，写前比对旧值，写后读回确认。
+  - **部位再生（v0.14，实验）**：逐部位打开 `RegenerationEnabled`，支持独立选择全部 38 个部位。已经开启原生再生的部位不再直接回填 HP 或清损坏位，保留游戏处理回血事件的机会。离开罩子、`off`、`reload` 时按原地址恢复原值；写回失败会保留记录并重试。
+  - 旧的部位回填路径 / 弹药组件：在进程内调用 `WriteProcessMemory`。只写 `PAGE_READWRITE` 页，写前比对旧值，写后读回确认。
   - 坦克/FRV 车体血量：通过 `GameSession.set_game_object_field` 写，只在本机拥有该对象时写。
 - 没有护盾时，mod 每 3 秒只做一次轻量扫描，并且会把配置里的回血开关写回原值。
 
@@ -79,8 +83,9 @@ Helldivers 2 Lua mod。**FX-12 护盾发生器**的罩子张开期间，罩子�
 
 - 配置表按“单位资源”共享，所以只在**本机有权威**的载具停在罩子里时打开，离开后写回原值；
   打开期间同种载具（包括不在罩子里的）也会回血。
-- 部位的回血开关 `RegenerationEnabled` 偏移还没在游戏内确认，默认关（`native_zone=0`）；
-  发一次 `healcfg` 看候选偏移，确认后再填。
+- v0.14 根据 filediver 的字段顺序和已确认的部位名/HP/步长推导 `RegenerationEnabled=+0x13d`，并逐部位检查邻近字段。**这不是当前游戏中的模型恢复验证**；已掉落的门、手臂和被禁用的物理部件能否恢复，需要进游戏观察。
+- 老设置文件如果含 `native_zone=0`，升级后仍会使用旧路径。测试新功能时改为 `native_zone=0x13d`、`part_regen=1`、`heal=native`，发 `reload`。
+- 实现和实测步骤见 [docs/部位再生.md](docs/部位再生.md)。
 - 原理、字段表、限制和验证方法见 [docs/回血原理.md](docs/回血原理.md)。
 
 ## 风险提示
@@ -95,6 +100,7 @@ pip install lupa
 python tests/svr_test.py         # heal=write 兜底路径（LuaJIT + 模拟内存）
 python tests/native_heal_test.py # 游戏自带回血：打开配置 / 不写主血量 / 离开后写回原值
 python tests/native_guard_test.py# 配置头不对时拒绝写入
+python tests/part_regen_test.py   # 38 个部位 / 独立开关 / 异常布局 / 恢复与重试
 ```
 
 ## 目录

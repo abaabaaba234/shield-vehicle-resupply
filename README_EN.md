@@ -24,9 +24,11 @@ All files are in `%LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\`:
 - `shield_resupply_cmd.txt`: commands, one per line. Each runs within 0.5 s.
 - `ShieldVehicleResupply.log`: log and command output.
 
-Commands: `status`, `on`, `off`, `reload`, `test`, `vehicles`, `weapons`, `units`, `recent [n]`, `healcfg`, `hptrace [secs]`, `heal native|write|off`, `probe`, `netinfo`, `netset`. The Chinese README has the full settings table.
+Commands: `status`, `on`, `off`, `reload`, `test`, `vehicles`, `parts`, `weapons`, `units`, `recent [n]`, `healcfg`, `hptrace [secs]`, `heal native|write|off`, `probe`, `netinfo`, `netset`. The Chinese README has the full settings table.
 
-Key healing settings: `heal` (`native` by default: use the game's own regeneration; `write`: the old per-tick HP write, kept as a fallback; `off`), `native_zone` (byte offset of the per-zone `RegenerationEnabled` flag, `0` = off until confirmed in game), `native_segments`, `native_force`.
+Key healing settings: `heal` (`native` by default: use the game's own regeneration; `write`: the old per-tick HP write, kept as a fallback; `off`), `native_zone` (`0x13d` by default, derived from filediver's layout and guarded per part; `0` uses the old part HP writes), `part_regen` (default `1`), `native_segments`, `native_force`.
+
+Use `parts` to list resource/zone hashes. Independently choose a part with `part=<16-digit resource hash>:<8-digit zone hash>=0|1`; entries override `part_regen`. Disabled parts are also excluded from the old HP-write fallback. Existing settings with `native_zone=0` need updating to `0x13d` to try this feature.
 
 ## How it works
 - It reuses DRIVER HUD / HUD's read-only native reader: the Health and Magazine/Rounds component layouts plus their code guards.
@@ -37,7 +39,8 @@ Key healing settings: `heal` (`native` by default: use the game's own regenerati
   sanity-checked before any write, and the original values are written back when no authoritative vehicle
   is inside the shield. This is what replaced the v0.12 memory scan (and its stutter).
 - Writes:
-  - Health damage zones and ammo components are written with in-process `WriteProcessMemory`. The mod only writes `PAGE_READWRITE` pages, compares the old value before writing, and reads the value back afterwards.
+  - v0.14 enables each selected damage zone's own regeneration, including zones with nonpositive HP. The mod leaves HP and damage-state transitions to the game for those zones. Original flags are restored on exit, off, and reload; failed restores are retained for retries. Model/physics restoration remains unverified.
+  - The old HP-write fallback and ammo components use in-process `WriteProcessMemory` on `PAGE_READWRITE` pages, with compare-before-write and readback checks.
   - Tank/FRV hull HP is written with `GameSession.set_game_object_field`, and only for objects this machine owns.
 - While no shield is up, the mod only runs a light scan every 3 s and restores the config values.
 
@@ -48,8 +51,8 @@ v0.13 instead enables the game's built-in regeneration, so the game keeps both c
 
 - The config is shared per unit resource, so it is only enabled while an authoritative vehicle of that type is
   inside the shield, and restored right after. During that time, other vehicles of the same type regenerate too.
-- The per-zone regeneration flag offset is not confirmed in game yet, so `native_zone` defaults to `0` (off).
-  Run `healcfg` and check the candidate offsets it logs.
+- The per-zone offset is derived from the upstream schema and checked against zone names, HP limits, neighboring booleans, floats and child-zone references. This does not prove that the game will regrow detached models or restore disabled physics actors. Dead/removed independent entities such as arms are not respawned.
+- `parts` reports the configuration flag and healing event; configuration `regen=1` alone is not proof of successful repair. See [docs/部位再生.md](docs/部位再生.md) for the in-game experiment (Chinese).
 - Details, field table and how to verify in game: [docs/回血原理.md](docs/回血原理.md) (Chinese).
 
 ## Risk
@@ -62,6 +65,7 @@ pip install lupa
 python tests/svr_test.py         # offline test, heal=write fallback (LuaJIT + mocked memory)
 python tests/native_heal_test.py # native regen: enable config / no HP write / restore on exit
 python tests/native_guard_test.py# refuses to write when the config header does not look right
+python tests/part_regen_test.py   # all 38 parts / individual selection / layout and restore guards
 ```
 
 ## License

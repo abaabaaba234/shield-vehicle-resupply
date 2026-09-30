@@ -34,10 +34,13 @@ i32 = lambda a: struct.unpack('<i', M.r(a, 4))[0]
 run(40)
 hp, z0 = i32(rec + 0x14), i32(rec + 0xF8)
 print('配置: rate=%.1f dis=%d cooldown=%.1f segments=%d regen=%.1f' % (f32(4), M.r(cfg + 8, 1)[0], f32(0x0C), u32(0x10), f32(0x14)))
-print('主血量=%d(应保持 1000，mod 不写) 部位0=%d(应被 mod 写到 400)' % (hp, z0))
+print('主血量=%d(应保持 1000，mod 不写) 部位0=%d(应保持 100，交给游戏再生)' % (hp, z0))
 print('writes=%s open=%s' % (L.eval(b'SVR.W.writes'), L.eval(b'SVR.C.heal')))
 good = (f32(4) == 900.0 and M.r(cfg + 8, 1)[0] == 0 and f32(0x0C) == 2.0
-        and u32(0x10) == 1 and f32(0x14) == 900.0 and hp == 1000 and z0 == 400)
+        and u32(0x10) == 1 and f32(0x14) == 900.0 and hp == 1000 and z0 == 100
+        and M.r(cfg + 0x208 + 0x13D, 1) == b'\1'
+        and M.r(cfg + 0x208 + 0x228 + 0x13D, 1) == b'\1'
+        and i32(rec + 0xFC) == -40)
 log = open(os.path.join(logs, 'ShieldVehicleResupply.log'), encoding='utf-8').read()
 good = good and 'native on' in log and 'hunt' not in log and 'shadow' not in log
 
@@ -46,6 +49,7 @@ L.execute(b'SVR.C.test=false')
 run(10)
 print('离开后: rate=%.1f dis=%d cooldown=%.1f segments=%d regen=%.1f' % (f32(4), M.r(cfg + 8, 1)[0], f32(0x0C), u32(0x10), f32(0x14)))
 good = good and f32(4) == 0.0 and f32(0x0C) == 0.0 and u32(0x10) == 0 and f32(0x14) == 0.0
+good = good and M.r(cfg + 0x208 + 0x13D, 1) == b'\0' and M.r(cfg + 0x208 + 0x228 + 0x13D, 1) == b'\0'
 log = open(os.path.join(logs, 'ShieldVehicleResupply.log'), encoding='utf-8').read()
 good = good and 'native close' in log and 'tick error' not in log
 for line in log.splitlines():
