@@ -16,6 +16,8 @@ Repair and resupply stop when the bubble goes away. The generator entity disappe
 
 **v0.20** adds default-enabled `frv_tire_guard=1` and `exo_shield_guard=1`. FRV tyres retain their models through prevention configuration and receive the native physical puncture transformation at 1 HP; recovery requires more than 5% (18 HP for a 350-HP tyre). Either the EXO-55 shield shoulder (800 HP) or plate (5000 HP) reaching the floor disables that mech's flak gun. Each latched pool must independently exceed 5% before attacks resume. Intact components must be discovered before fatal damage; detached models are not rebuilt. Offline tests pass; new model, movement and shield behavior still require in-game validation. See [tyre and shield notes](docs/轮胎与大盾保护.md).
 
+The user confirmed front-left tyre model retention and punctured driving in v0.20, but shield repair left that tyre at 1 HP. **v0.21 fixes the repair trigger**: protected FRVs use game repair for non-full zones, rather than requiring nonpositive HP or destroyed bits. Game repair and config regeneration are mutually exclusive; partial policies retain selective wheel HP repair. Nine offline test scripts pass, including the full-hull/1-HP tyre reproduction. Actual v0.21 recovery and shield-pool behavior still need in-game confirmation.
+
 v0.19 corrects attachment parsing using a read-only capture from a running mech. The Attachable parent field contains the mech's full Unit handle; previous versions treated it as an entity ID, so protection never armed. The full handle now matches a known mech with current network identity and living authoritative Health. Logs include `parent`, `parent_unit` and `chain`. Confirm `weapon guard armed` before testing fatal damage.
 
 ## Install

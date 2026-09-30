@@ -150,3 +150,33 @@ lua.execute(b'SVR.W.raw=function() return false end')
 mem.w(rec+0xf8,I(1));run(lua,3)
 assert lua.eval(b'sim_calls.damage')==0
 print('PASS: protection-write failures defer physical puncture until protection is armed')
+
+# Reproduce live v0.20: a protected tyre is at 1 HP with no destroyed bit and
+# the hull is full. A real shield service pass must actually raise its health.
+mem,lua,cfg,rec,logs,samples=fixture();run(lua,3)
+mem.w(rec+0xf8,I(1));mem.w(rec+0x20,U(0));run(lua,1)
+lua.execute(b'SVR.C.test=true;SVR.C.part_repair=true;SVR.C.cooldown=0')
+run(lua,2)
+hp=struct.unpack('<i',mem.r(rec+0xf8,4))[0]
+assert 1<hp<=17 and physical(lua,2)[40]==1 and lua.eval(b'sim_calls.heal')==1
+assert lua.eval(b'next(SVR.S.native or {})') is None, 'config regen stacked with game repair'
+run(lua,8)
+assert physical(lua,2)==samples[2] and struct.unpack('<i',mem.r(rec+0xf8,4))[0]>17
+print('PASS: full-hull 1-HP tyre with no dead bits receives shield repair; physics restores only above 5%')
+
+for why in ('wheel disabled','other part disabled','part repair disabled','heal off'):
+    mem,lua,cfg,rec,logs,samples=fixture();run(lua,3)
+    mem.w(rec+0xf8,I(1));run(lua,1)
+    lua.execute(b'SVR.C.test=true;SVR.C.part_repair=true;SVR.C.cooldown=0')
+    mem.w(rec+0xf8+4*4,I(25))
+    if why=='wheel disabled':lua.execute(b"SVR.C.part['9b2140378640432e:fed0a478']=false")
+    elif why=='other part disabled':lua.execute(b"SVR.C.part['9b2140378640432e:6eaa2901']=false")
+    elif why=='part repair disabled':lua.execute(b'SVR.C.part_repair=false')
+    elif why=='heal off':lua.execute(b"SVR.C.heal='off'")
+    run(lua,15)
+    assert lua.eval(b'sim_calls.heal')==0,why+' bypassed part policy'
+    if why in ('wheel disabled','heal off'):
+        assert mem.r(rec+0xf8,4)==I(1) and physical(lua,2)[40]==1,why
+    else:assert struct.unpack('<i',mem.r(rec+0xf8,4))[0]>17 and physical(lua,2)==samples[2],why
+    if why=='other part disabled':assert mem.r(rec+0xf8+4*4,4)==I(25)
+print('PASS: wheel repair policies and heal-off respected; selected wheels repair independently when whole-unit calls are disabled')

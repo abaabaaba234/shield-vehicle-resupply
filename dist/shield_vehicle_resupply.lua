@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply
--- Shield Vehicle Resupply v0.20
+-- Shield Vehicle Resupply v0.21
 -- Native read layer: DRIVER HUD 1.4.5 / HUD 1.11.1, Copyright (c) 2026 FireScallion, MIT License
 -- (see third_party/LICENSE-DRIVER-HUD.txt). Writes are added by this mod.
 local N=(function()
@@ -2642,13 +2642,14 @@ local function repair_parts(v, zones, data, rate, dt, key, cfg)
         end
     end
     local mech = v.kind == 'exo' or v.kind == 'arm'
-    local damaged = mech and i32(data, 0x14) < v.zcache.mx or false
+    local engine_vehicle = mech or (v.kind == 'frv' and C.frv_tire_guard)
+    local damaged = engine_vehicle and i32(data, 0x14) < v.zcache.mx or false
     local all_selected = true
     for _, z in ipairs(zones) do
         if z.max > 0 then
             if not part_enabled(d.resource, z.hash) then all_selected = false end
             local bits = z.i < 16 and math.floor(u32(data, 0x20) / 4 ^ z.i) % 4 or 0
-            if (z.hp > -1000000 and z.hp < (mech and z.max or 1)) or bits == 2 then damaged = true end
+            if (z.hp > -1000000 and z.hp < (engine_vehicle and z.max or 1)) or bits == 2 then damaged = true end
         end
     end
     if C.part_repair then
@@ -2740,19 +2741,20 @@ local function heal(v, dt)
         if not ok or not parent then return 'detached_arm' end
     end
     local rate = C[HEAL_RATE[v.kind]]
-    -- Mechs use one healing backend: the engine repair function also heals main HP.
-    -- Running config regeneration alongside it would double exo_heal and may consume
+    -- Mechs and guarded FRVs use one healing backend; the repair function heals main HP.
+    -- Running config regeneration alongside it would double healing and may consume
     -- the damaged-zone transition before the engine's repair event can handle it.
-    local engine_mech = (v.kind == 'exo' or v.kind == 'arm') and C.part_repair and REPAIR.health ~= nil
-    if engine_mech then
+    local engine_repair = (v.kind == 'exo' or v.kind == 'arm' or (v.kind == 'frv' and C.frv_tire_guard))
+        and C.part_repair and REPAIR.health ~= nil
+    if engine_repair then
         for _, z in ipairs(zones) do
-            if z.max > 0 and not part_enabled(d.resource, z.hash) then engine_mech = false; break end
+            if z.max > 0 and not part_enabled(d.resource, z.hash) then engine_repair = false; break end
         end
     end
     -- v0.13：主血量交给游戏自带的回血（打开 HealthComponent 配置里的开关/速率）。
     -- 游戏自己涨的血不会在下一次受伤时被它另存的那份血量盖回去，所以不用扫内存。
     local native_zones = {}
-    if C.heal == 'native' and cfg and not engine_mech then
+    if C.heal == 'native' and cfg and not engine_repair then
         local _, active = native_apply(v, cfg, mx, mx * rate, zc)
         native_zones = active or {}
     end
@@ -2767,7 +2769,7 @@ local function heal(v, dt)
     if C.cooldown > 0 and S.last_hit[key] and S.clock - S.last_hit[key] < C.cooldown then return 'cooldown' end
 
     local changed = repair_parts(v, zones, data, rate, dt, key, cfg)
-    if C.heal == 'write' and not engine_mech and hp < mx then  -- 游戏维修函数也处理主血量
+    if C.heal == 'write' and not engine_repair and hp < mx then  -- 游戏维修函数也处理主血量
         local n = amount(key .. ':h', mx, rate, dt)
         if n > 0 and W.i32(rec + 0x14, hp, math.min(mx, hp + n)) then changed = changed + 1 end
     end
@@ -2775,7 +2777,11 @@ local function heal(v, dt)
     for _, z in ipairs(zones) do
         -- 已开启原生再生的部位（包含 HP<=0）由游戏负责，保留 OnHeal 的触发机会。
         -- 按部位禁用时也不走逐帧回填；native_zone=0 可退回原先的修血路径。
-        if not engine_mech and part_enabled(d.resource, z.hash) and not native_zones[z.i] and z.max > 0 and z.hp < z.max then
+        -- A protected wheel at 1 HP is alive, so the old destroyed-only repair
+        -- trigger misses it. If whole-unit repair is unavailable/disabled by a
+        -- part policy, maintain selected wheels through the existing HP fallback.
+        local guarded_wheel = v.kind == 'frv' and C.frv_tire_guard and WHEEL[z.hash]
+        if not engine_repair and part_enabled(d.resource, z.hash) and (not native_zones[z.i] or guarded_wheel) and z.max > 0 and z.hp < z.max then
             local zk = key .. z.key
             local zo = 0xF8 + 4 * z.i
             if z.hp > 0 then
@@ -3439,5 +3445,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.20 (轮胎模型保护及大盾机甲故障联动；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.21 (修正 1HP 轮胎的护盾维修触发；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }
