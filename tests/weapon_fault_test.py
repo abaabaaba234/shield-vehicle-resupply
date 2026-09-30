@@ -199,3 +199,48 @@ assert failed(lua) and ammo(mem)==bytes(8), 'protection write failure bypassed f
 lua.execute(b'fail_address=nil');run(lua,1)
 assert mem.r(cfg+0x208+0xf0,1)==b'\1'
 print('PASS: failure latch still blocks at 1 HP while a protection write is being retried')
+
+for nodes in ((202,), (202,203), (202,203,204)):
+    mem,lua,cfg,rec,logs,original=fixture()
+    env['bridge_chain'](mem,nodes)
+    run(lua,2)
+    assert mem.r(cfg+0x208+0xf0,1)==b'\1' and ammo(mem)==I(55)+I(6), nodes
+    chain='->'.join(str(i) for i in (100,*nodes,101))
+    log=(logs/'ShieldVehicleResupply.log').read_text(encoding='utf-8',errors='replace')
+    assert f'parent=101 chain={chain}' in log, log
+    mem.w(rec+0xf8,I(1));run(lua,1)
+    assert failed(lua) and ammo(mem)==bytes(8), nodes
+    mem.w(rec+0xf8,I(41));run(lua,1)
+    assert not failed(lua) and ammo(mem)==I(55)+I(6), nodes
+print('PASS: native-only attachment bridges arm protection and preserve 1 HP/5% weapon behavior; success logs include chain')
+
+for why in ('missing bridge row','cycle','too deep','dead mech','non-authoritative mech'):
+    mem,lua,cfg,rec,logs,original=fixture()
+    env['bridge_chain'](mem,(202,))
+    if why=='missing bridge row':mem.w(env['AROWS']+0x30,U(9999))
+    elif why=='cycle':mem.w(env['AROWS']+0x30,U(100))
+    elif why=='too deep':env['bridge_chain'](mem,(202,203,204,205))
+    elif why=='dead mech':mem.w(rec+0x1b8+0x19c,U(2))
+    elif why=='non-authoritative mech':mem.w(0x20000000+0xF32F18+24+20,U(0))
+    mem.w(rec+0xf8,I(1));run(lua,2)
+    assert mem.r(cfg,0x5650)==original and ammo(mem)==I(55)+I(6),why
+    if why=='missing bridge row':
+        log=(logs/'ShieldVehicleResupply.log').read_text(encoding='utf-8',errors='replace')
+        assert 'chain=100->202->9999' in log,log
+print('PASS: broken native-only chains cannot arm protection or clear ammo; failed chain IDs are logged')
+
+mem,lua,cfg,rec,logs,original=fixture()
+env['bridge_chain'](mem,(202,))
+original_read,injected=mem.r,[False]
+def changing_bridge(a,n):
+    data=original_read(int(a),int(n))
+    if a==env['AROWS']+0x30 and n==4 and not injected[0]:
+        injected[0]=True
+        mem.w(env['AROWS'],U(222))
+    return data
+lua.globals()[b'pyread']=changing_bridge
+mem.w(rec+0xf8,I(1));run(lua,2)
+assert injected[0] and mem.r(cfg,0x5650)==original and ammo(mem)==I(55)+I(6)
+log=(logs/'ShieldVehicleResupply.log').read_text(encoding='utf-8',errors='replace')
+assert 'identity changed during sample' in log,log
+print('PASS: attachment bridge changes during sampling prevent all weapon writes')

@@ -1929,5 +1929,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.17 (非盾牌机甲武器故障保护；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.18 (修正机甲武器挂接链校验；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

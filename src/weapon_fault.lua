@@ -126,7 +126,7 @@ return function(N, W, R, C, log, ammo_components)
         end
         if not ready then return false end
         if not e.logged then
-            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx)
+            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d chain=%s (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.chain)
         end
         return true
     end
@@ -175,7 +175,8 @@ return function(N, W, R, C, log, ammo_components)
     local function service(v)
         local d=v.d
         local s=snapshot(d)
-        local parent,why=R.arm_parent(d,s.g); need(parent~=nil,why)
+        local parent,why,chain=R.arm_parent(d,s.g); need(parent~=nil,why)
+        s.parent,s.chain=parent,chain
         local k=key(d)
         local st=F.states[k] or {d=d}; F.states[k]=st
         st.seen=true; st.hp,st.mx=s.hp,s.mx

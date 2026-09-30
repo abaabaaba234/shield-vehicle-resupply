@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply
--- Shield Vehicle Resupply v0.17
+-- Shield Vehicle Resupply v0.18
 -- Native read layer: DRIVER HUD 1.4.5 / HUD 1.11.1, Copyright (c) 2026 FireScallion, MIT License
 -- (see third_party/LICENSE-DRIVER-HUD.txt). Writes are added by this mod.
 local N=(function()
@@ -679,26 +679,30 @@ return function(N, log)
         local t = g:table(am + R.attach.tbl)
         local rows = N.ptr(g:watch(am + R.attach.rows, 8), 0)
         local net, hm = g:root('network'), g:root('health')
-        local cur, seen = d.entity, {}
+        local cur, seen, chain = d.entity, {}, {tostring(d.entity)}
+        local function trace() return table.concat(chain, '->') end
         for _ = 1, 4 do
-            need(not seen[cur], 'cyclic arm attachment'); seen[cur] = true
+            need(not seen[cur], 'cyclic arm attachment (chain='..trace()..')'); seen[cur] = true
             local row = g:lookup(t, cur)
-            if row == nil then return nil, 'arm has no attachment row' end
+            if row == nil then return nil, 'arm has no attachment row (chain='..trace()..')' end
             local parent = N.u32(g:watch(rows + row * R.attach.stride, 4), 0)
-            if parent == 0 or parent == 0xFFFFFFFF then return nil, 'arm is detached' end
+            if parent == 0 or parent == 0xFFFFFFFF then return nil, 'arm is detached (chain='..trace()..')' end
+            chain[#chain+1] = tostring(parent)
             local pd = g:net(net, parent, true)
-            need(pd ~= nil, 'arm attachment parent no longer exists')
-            g:roundtrip(net, pd)
-            if exo_types[pd.resource] then
+            -- Attachable links are entity IDs, including local/non-network bridge
+            -- entities. Follow their typed rows; only the final mech must have a
+            -- network roundtrip and authoritative, living Health component.
+            if pd then g:roundtrip(net, pd) end
+            if pd and exo_types[pd.resource] then
                 local i, hd = g:component(hm, pd.entity, 0x1030, 0x1048)
                 need(i ~= nil and N.same(hd, pd) and hd.flags % 2 == 1, 'arm parent is not authoritative')
                 local rec = N.ptr(g:watch(hm + 0x1058, 8), 0) + i * 0x1B8
                 need(N.i32(g:watch(rec + 0x14, 4), 0) > 0 and N.u32(g:watch(rec + 0x19C, 4), 0) == 0, 'arm parent is dead')
-                return pd
+                return pd, nil, trace()
             end
             cur = parent
         end
-        return nil, 'no exosuit in arm attachment chain'
+        return nil, 'no exosuit in arm attachment chain (chain='..trace()..')'
     end
     local function owner(d, empty_arm)
         local g, hm, rec = owner_graph(d)
@@ -723,9 +727,9 @@ return function(N, log)
     function R.arm_parent(d, graph)
         need(R.arm_types[d.resource], 'unsupported arm resource')
         local g = graph or owner_graph(d)
-        local pd, why = mounted_parent(g, d)
+        local pd, why, chain = mounted_parent(g, d)
         g:validate()
-        return pd, why
+        return pd, why, chain
     end
     -- The first float in the guarded 13-float StatModifier row is movement speed.
     -- Health/zone maxima are read fresh here; a stale "full" snapshot cannot cure a leg.
@@ -1048,7 +1052,7 @@ return function(N, W, R, C, log, ammo_components)
         end
         if not ready then return false end
         if not e.logged then
-            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx)
+            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d chain=%s (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.chain)
         end
         return true
     end
@@ -1097,7 +1101,8 @@ return function(N, W, R, C, log, ammo_components)
     local function service(v)
         local d=v.d
         local s=snapshot(d)
-        local parent,why=R.arm_parent(d,s.g); need(parent~=nil,why)
+        local parent,why,chain=R.arm_parent(d,s.g); need(parent~=nil,why)
+        s.parent,s.chain=parent,chain
         local k=key(d)
         local st=F.states[k] or {d=d}; F.states[k]=st
         st.seen=true; st.hp,st.mx=s.hp,s.mx
@@ -3118,5 +3123,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.17 (非盾牌机甲武器故障保护；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.18 (修正机甲武器挂接链校验；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

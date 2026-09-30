@@ -175,6 +175,14 @@ def arm_fixture():
     return mem, lua, cfg, rec, logs
 
 
+def bridge_chain(mem, nodes):
+    """Native-only intermediate entities deliberately absent from network/Health."""
+    ids = (100, *nodes)
+    maps(mem, AM + 0x18, AENTRIES, [(entity, i) for i, entity in enumerate(ids)])
+    for i, parent in enumerate((*nodes, 101)):
+        mem.w(AROWS + i * 0x30, U(parent))
+
+
 mem, lua, cfg, rec, logs = arm_fixture()
 config_before = mem.r(cfg, 0x1c)
 run(lua, 60)
@@ -202,6 +210,26 @@ for why in ('engine dead', 'detached', 'dead parent', 'parent non-authority', 'a
     run(lua)
     assert lua.eval(b'sim_calls.heal') == 0 and hp(mem,rec+0x14) == 0, why
 print('PASS: dead/detached arms, invalid parents/guards and disabled repair never receive native calls')
+
+for nodes in ((202,), (202,203), (202,203,204)):
+    mem, lua, cfg, rec, logs = arm_fixture()
+    bridge_chain(mem, nodes)
+    run(lua, 60)
+    assert hp(mem, rec+0x14) == hp(mem, rec+0xf8) == 800, nodes
+    assert lua.eval(b'sim_calls.heal') == 8, nodes
+print('PASS: zero-HP arm repair follows one to three native-only bridges to a living authoritative mech')
+
+for why in ('missing bridge row', 'cycle', 'too deep', 'dead mech', 'non-authoritative mech'):
+    mem, lua, cfg, rec, logs = arm_fixture()
+    bridge_chain(mem, (202,))
+    if why == 'missing bridge row': mem.w(AROWS+0x30, U(9999))
+    elif why == 'cycle': mem.w(AROWS+0x30, U(100))
+    elif why == 'too deep': bridge_chain(mem, (202,203,204,205))
+    elif why == 'dead mech': mem.w(rec+0x1b8+0x19c, U(2))
+    elif why == 'non-authoritative mech': mem.w(0x20000000+0xF32F18+24+20, U(0))
+    run(lua)
+    assert lua.eval(b'sim_calls.heal') == 0 and hp(mem,rec+0x14) == 0, why
+print('PASS: allowing native-only bridges still rejects missing/cyclic/deep chains and dead/non-authoritative mechs')
 
 mem, lua, cfg, rec, logs = fixture()
 lua.execute(b'SVR.C.part_repair=true; SVR.C.exo_leg_fix=true')
