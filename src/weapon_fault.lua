@@ -126,7 +126,7 @@ return function(N, W, R, C, log, ammo_components)
         end
         if not ready then return false end
         if not e.logged then
-            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d chain=%s (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.chain)
+            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d parent_unit=%d/%08x chain=%s (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.parent.unit,s.parent.unit,s.chain)
         end
         return true
     end

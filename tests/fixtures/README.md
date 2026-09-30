@@ -29,3 +29,16 @@ the zone has `AffectsMainHealth=0` and `CausesDeathOnDeath=1` before modificatio
 They exercise both known non-shield weapon zone layouts. The tests simulate
 engine repair and weapon firing; they do not prove the game's exact immortal
 clamp, model retention or suppression of continuous fire.
+
+`attachable_live_v0.18.json` was captured read-only from the user's running
+v0.18 game on 2026-10-01 using VM_READ and guarded component/network tables.
+It contains six descriptors (one authoritative EXO-49 and its two arms,
+plus three non-authoritative equivalents), Health summaries and each
+Attachable row's first 12 bytes. World transforms and process addresses are
+excluded. The row stride is 0xAC and the manager's row-pointer offset is +0x38.
+Arms 551/552 contain parent 4194742, the full UnitReference of mech entity 550;
+it is neither the parent's entity ID nor either child's UnitReference.
+The regression replays these exact handles and row prefixes in the mock
+component tables, with distinct entity IDs. It rejects generation changes,
+stale/ambiguous candidates and changes during sampling. It verifies parent
+association, not the engine's damage or firing behavior.

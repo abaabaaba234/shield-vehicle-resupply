@@ -14,7 +14,7 @@ Repair and resupply stop when the bubble goes away. The generator entity disappe
 
 v0.17 adds `exo_weapon_guard=1` for non-shield mech weapons. Prevention configuration is armed before damage; reaching 1 HP latches failure and saves/empties ammunition. Repair must raise HP **strictly above 5%** to restore ammunition. A weapon below 5% that has never reached 1 HP remains usable. Protection runs outside the bubble too; ordinary repair still requires the bubble. Shield arms are excluded and failed models are not hidden. **The exact engine HP floor, prevention of detachment, and suppression of ongoing fire need in-game verification.** See [weapon failure notes](docs/武器故障保护.md) (Chinese).
 
-v0.18 fixes protection being skipped when an attachment chain includes a non-network intermediate entity. The chain follows verified native Attachable rows; its final mech still requires a network roundtrip and living authoritative Health. Success/failure logs include the chain IDs. Confirm `weapon guard armed` before testing fatal damage.
+v0.19 corrects attachment parsing using a read-only capture from a running mech. The Attachable parent field contains the mech's full Unit handle; previous versions treated it as an entity ID, so protection never armed. The full handle now matches a known mech with current network identity and living authoritative Health. Logs include `parent`, `parent_unit` and `chain`. Confirm `weapon guard armed` before testing fatal damage.
 
 ## Install
 1. Install [Bingus Shared Loader v17](https://www.nexusmods.com/helldivers2/mods/16292).

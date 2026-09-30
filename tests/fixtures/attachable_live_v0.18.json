@@ -1,0 +1,92 @@
+{
+  "captured_at": "2026-10-01",
+  "mod_version": "v0.18",
+  "stride": 172,
+  "rows_offset": 56,
+  "records": [
+    {
+      "resource": "c2d449ecf7facab1",
+      "entity": 550,
+      "unit": 4194742,
+      "goid": 396,
+      "flags": 1,
+      "health": {
+        "main": 1800,
+        "zone": 400,
+        "life": 0
+      },
+      "parent_raw": 0,
+      "attach_prefix_hex": "0000000000000000ffffffff"
+    },
+    {
+      "resource": "e5f64dcc3bfe9dd1",
+      "entity": 551,
+      "unit": 4194740,
+      "goid": 394,
+      "flags": 1,
+      "health": {
+        "main": 800,
+        "zone": 800,
+        "life": 0
+      },
+      "parent_raw": 4194742,
+      "attach_prefix_hex": "b601400053000000ffffffff"
+    },
+    {
+      "resource": "ff9878576a4c543b",
+      "entity": 552,
+      "unit": 4194741,
+      "goid": 395,
+      "flags": 1,
+      "health": {
+        "main": 800,
+        "zone": 800,
+        "life": 0
+      },
+      "parent_raw": 4194742,
+      "attach_prefix_hex": "b601400052000000ffffffff"
+    },
+    {
+      "resource": "e5f64dcc3bfe9dd1",
+      "entity": 558,
+      "unit": 4194760,
+      "goid": 4117,
+      "flags": 0,
+      "health": {
+        "main": 800,
+        "zone": 800,
+        "life": 0
+      },
+      "parent_raw": 4194762,
+      "attach_prefix_hex": "ca01400053000000ffffffff"
+    },
+    {
+      "resource": "ff9878576a4c543b",
+      "entity": 559,
+      "unit": 4194761,
+      "goid": 4118,
+      "flags": 0,
+      "health": {
+        "main": 800,
+        "zone": 800,
+        "life": 0
+      },
+      "parent_raw": 4194762,
+      "attach_prefix_hex": "ca01400052000000ffffffff"
+    },
+    {
+      "resource": "c2d449ecf7facab1",
+      "entity": 560,
+      "unit": 4194762,
+      "goid": 4119,
+      "flags": 0,
+      "health": {
+        "main": 1800,
+        "zone": 400,
+        "life": 0
+      },
+      "parent_raw": 0,
+      "attach_prefix_hex": "0000000000000000ffffffff"
+    }
+  ]
+}

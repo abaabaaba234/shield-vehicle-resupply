@@ -44,7 +44,7 @@ def fixture(resource=ARM,kind='turret'):
 
 
 def ammo(mem):return mem.r(ROWS,8)
-def failed(lua):return lua.eval(b"SVR.F.states['100:50:7:32c7063b4bcc4208'].broken")==True
+def failed(lua):return lua.eval(f"SVR.F.states['100:50:{env['ARM_UNIT']}:32c7063b4bcc4208'].broken".encode())==True
 
 
 mem,lua,cfg,rec,logs,original=fixture()
@@ -200,47 +200,46 @@ lua.execute(b'fail_address=nil');run(lua,1)
 assert mem.r(cfg+0x208+0xf0,1)==b'\1'
 print('PASS: failure latch still blocks at 1 HP while a protection write is being retried')
 
-for nodes in ((202,), (202,203), (202,203,204)):
-    mem,lua,cfg,rec,logs,original=fixture()
-    env['bridge_chain'](mem,nodes)
-    run(lua,2)
-    assert mem.r(cfg+0x208+0xf0,1)==b'\1' and ammo(mem)==I(55)+I(6), nodes
-    chain='->'.join(str(i) for i in (100,*nodes,101))
-    log=(logs/'ShieldVehicleResupply.log').read_text(encoding='utf-8',errors='replace')
-    assert f'parent=101 chain={chain}' in log, log
-    mem.w(rec+0xf8,I(1));run(lua,1)
-    assert failed(lua) and ammo(mem)==bytes(8), nodes
-    mem.w(rec+0xf8,I(41));run(lua,1)
-    assert not failed(lua) and ammo(mem)==I(55)+I(6), nodes
-print('PASS: native-only attachment bridges arm protection and preserve 1 HP/5% weapon behavior; success logs include chain')
+mem,lua,cfg,rec,logs,original=fixture()
+prefix=mem.r(env['AROWS'],12)
+run(lua,2)
+assert mem.r(cfg+0x208+0xf0,1)==b'\1' and ammo(mem)==I(55)+I(6)
+log=(logs/'ShieldVehicleResupply.log').read_text(encoding='utf-8',errors='replace')
+assert f"parent=101 parent_unit={env['MECH_UNIT']}/{env['MECH_UNIT']:08x}" in log,log
+assert f"chain=100->unit:{env['MECH_UNIT']:08x}->101" in log,log
+assert mem.r(env['AROWS'],12)==prefix, 'attachment data was modified'
+mem.w(rec+0xf8,I(1));run(lua,1)
+assert failed(lua) and ammo(mem)==bytes(8)
+mem.w(rec+0xf8,I(41));run(lua,1)
+assert not failed(lua) and ammo(mem)==I(55)+I(6)
+print('PASS: captured 0xAC/+0x38 attachment layout and full parent Unit arm protection; entity and Unit IDs stay distinct')
 
-for why in ('missing bridge row','cycle','too deep','dead mech','non-authoritative mech'):
+for why in ('raw entity instead of Unit','different Unit generation','stale roster','ambiguous Unit','dead mech','non-authoritative mech'):
     mem,lua,cfg,rec,logs,original=fixture()
-    env['bridge_chain'](mem,(202,))
-    if why=='missing bridge row':mem.w(env['AROWS']+0x30,U(9999))
-    elif why=='cycle':mem.w(env['AROWS']+0x30,U(100))
-    elif why=='too deep':env['bridge_chain'](mem,(202,203,204,205))
+    if why=='raw entity instead of Unit':mem.w(env['AROWS'],U(101))
+    elif why=='different Unit generation':mem.w(env['AROWS'],U(env['MECH_UNIT']+0x400000))
+    elif why=='stale roster':lua.execute(b'SVR.R.vehicle_roster=function() return {} end')
+    elif why=='ambiguous Unit':env['duplicate_parent_unit'](mem)
     elif why=='dead mech':mem.w(rec+0x1b8+0x19c,U(2))
     elif why=='non-authoritative mech':mem.w(0x20000000+0xF32F18+24+20,U(0))
     mem.w(rec+0xf8,I(1));run(lua,2)
     assert mem.r(cfg,0x5650)==original and ammo(mem)==I(55)+I(6),why
-    if why=='missing bridge row':
+    if why=='different Unit generation':
         log=(logs/'ShieldVehicleResupply.log').read_text(encoding='utf-8',errors='replace')
-        assert 'chain=100->202->9999' in log,log
-print('PASS: broken native-only chains cannot arm protection or clear ammo; failed chain IDs are logged')
+        assert f"parent_unit={env['MECH_UNIT']+0x400000}" in log,log
+print('PASS: raw entity aliases, Unit generation reuse, stale/ambiguous parents, death and authority cannot arm protection')
 
 mem,lua,cfg,rec,logs,original=fixture()
-env['bridge_chain'](mem,(202,))
 original_read,injected=mem.r,[False]
-def changing_bridge(a,n):
+def changing_parent_unit(a,n):
     data=original_read(int(a),int(n))
-    if a==env['AROWS']+0x30 and n==4 and not injected[0]:
+    if a==rec+0x1b8+0x14 and n==4 and not injected[0]:
         injected[0]=True
-        mem.w(env['AROWS'],U(222))
+        mem.w(env['AROWS'],U(env['MECH_UNIT']+0x400000))
     return data
-lua.globals()[b'pyread']=changing_bridge
+lua.globals()[b'pyread']=changing_parent_unit
 mem.w(rec+0xf8,I(1));run(lua,2)
 assert injected[0] and mem.r(cfg,0x5650)==original and ammo(mem)==I(55)+I(6)
 log=(logs/'ShieldVehicleResupply.log').read_text(encoding='utf-8',errors='replace')
 assert 'identity changed during sample' in log,log
-print('PASS: attachment bridge changes during sampling prevent all weapon writes')
+print('PASS: parent UnitReference changes during sampling prevent all weapon writes')

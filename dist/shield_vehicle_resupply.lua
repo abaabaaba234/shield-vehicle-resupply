@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply
--- Shield Vehicle Resupply v0.18
+-- Shield Vehicle Resupply v0.19
 -- Native read layer: DRIVER HUD 1.4.5 / HUD 1.11.1, Copyright (c) 2026 FireScallion, MIT License
 -- (see third_party/LICENSE-DRIVER-HUD.txt). Writes are added by this mod.
 local N=(function()
@@ -679,30 +679,34 @@ return function(N, log)
         local t = g:table(am + R.attach.tbl)
         local rows = N.ptr(g:watch(am + R.attach.rows, 8), 0)
         local net, hm = g:root('network'), g:root('health')
-        local cur, seen, chain = d.entity, {}, {tostring(d.entity)}
-        local function trace() return table.concat(chain, '->') end
-        for _ = 1, 4 do
-            need(not seen[cur], 'cyclic arm attachment (chain='..trace()..')'); seen[cur] = true
-            local row = g:lookup(t, cur)
-            if row == nil then return nil, 'arm has no attachment row (chain='..trace()..')' end
-            local parent = N.u32(g:watch(rows + row * R.attach.stride, 4), 0)
-            if parent == 0 or parent == 0xFFFFFFFF then return nil, 'arm is detached (chain='..trace()..')' end
-            chain[#chain+1] = tostring(parent)
-            local pd = g:net(net, parent, true)
-            -- Attachable links are entity IDs, including local/non-network bridge
-            -- entities. Follow their typed rows; only the final mech must have a
-            -- network roundtrip and authoritative, living Health component.
-            if pd then g:roundtrip(net, pd) end
-            if pd and exo_types[pd.resource] then
-                local i, hd = g:component(hm, pd.entity, 0x1030, 0x1048)
-                need(i ~= nil and N.same(hd, pd) and hd.flags % 2 == 1, 'arm parent is not authoritative')
-                local rec = N.ptr(g:watch(hm + 0x1058, 8), 0) + i * 0x1B8
-                need(N.i32(g:watch(rec + 0x14, 4), 0) > 0 and N.u32(g:watch(rec + 0x19C, 4), 0) == 0, 'arm parent is dead')
-                return pd, nil, trace()
+        local row = g:lookup(t, d.entity)
+        if row == nil then return nil, 'arm has no attachment row (entity='..d.entity..')' end
+        -- Live v0.18 capture: this field is the parent's full UnitReference,
+        -- not its entity ID (arm 551 -> unit 4194742 -> mech entity 550).
+        local parent_unit = N.u32(g:watch(rows + row * R.attach.stride, 4), 0)
+        local context = string.format('arm=%d parent_unit=%d/%08x',d.entity,parent_unit,parent_unit)
+        if parent_unit == 0 or parent_unit == 0xFFFFFFFF then return nil, 'arm is detached ('..context..')' end
+        need(type(R.vehicle_roster)=='function', 'vehicle roster unavailable ('..context..')')
+        local roster = R.vehicle_roster()
+        need(type(roster)=='table' and #roster<=4096, 'vehicle roster bound ('..context..')')
+        local matches, visited = {}, {}
+        for _, v in ipairs(roster) do
+            local candidate = v.d
+            if candidate and exo_types[candidate.resource] and candidate.unit==parent_unit then
+                local pd = g:net(net,candidate.entity,true)
+                if pd and N.same(pd,candidate) and not visited[pd.entity] then
+                    g:roundtrip(net,pd)
+                    visited[pd.entity]=true; matches[#matches+1]=pd
+                end
             end
-            cur = parent
         end
-        return nil, 'no exosuit in arm attachment chain (chain='..trace()..')'
+        if #matches~=1 then return nil, 'parent UnitReference must match exactly one known mech ('..context..' matches='..#matches..')' end
+        local pd = matches[1]
+        local i, hd = g:component(hm,pd.entity,0x1030,0x1048)
+        need(i~=nil and N.same(hd,pd) and pd.flags%2==1 and hd.flags%2==1, 'arm parent is not authoritative ('..context..')')
+        local rec = N.ptr(g:watch(hm+0x1058,8),0)+i*0x1B8
+        need(N.i32(g:watch(rec+0x14,4),0)>0 and N.u32(g:watch(rec+0x19C,4),0)==0, 'arm parent is dead ('..context..')')
+        return pd, nil, string.format('%d->unit:%08x->%d',d.entity,parent_unit,pd.entity)
     end
     local function owner(d, empty_arm)
         local g, hm, rec = owner_graph(d)
@@ -1052,7 +1056,7 @@ return function(N, W, R, C, log, ammo_components)
         end
         if not ready then return false end
         if not e.logged then
-            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d chain=%s (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.chain)
+            e.logged=true; log('weapon guard armed %s ent=%d zone=%s max=%d parent=%d parent_unit=%d/%08x chain=%s (Immortal; shield excluded)',s.d.resource,s.d.entity,s.zone,s.mx,s.parent.entity,s.parent.unit,s.parent.unit,s.chain)
         end
         return true
     end
@@ -1527,6 +1531,7 @@ local S = {
     prev_counts = nil, seen_ent = nil, spotted = {},
     last_total = {}, last_hit = {}, frac = {}, ammo_max = {}, reported = {},
 }
+REPAIR.vehicle_roster = function() return S.vehicles end
 local function reset_context()
     S.vehicles, S.weapons, S.shields, S.seen_ent, S.spotted = {}, {}, {}, nil, {}
     S.last_total, S.last_hit, S.frac, S.ammo_max, S.reported, S.next_roster = {}, {}, {}, {}, {}, 0
@@ -3123,5 +3128,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.18 (修正机甲武器挂接链校验；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.19 (按完整父 Unit 句柄关联机甲武器；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

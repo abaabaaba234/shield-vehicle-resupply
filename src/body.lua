@@ -333,6 +333,7 @@ local S = {
     prev_counts = nil, seen_ent = nil, spotted = {},
     last_total = {}, last_hit = {}, frac = {}, ammo_max = {}, reported = {},
 }
+REPAIR.vehicle_roster = function() return S.vehicles end
 local function reset_context()
     S.vehicles, S.weapons, S.shields, S.seen_ent, S.spotted = {}, {}, {}, nil, {}
     S.last_total, S.last_hit, S.frac, S.ammo_max, S.reported, S.next_roster = {}, {}, {}, {}, {}, 0
@@ -1929,5 +1930,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.18 (修正机甲武器挂接链校验；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.19 (按完整父 Unit 句柄关联机甲武器；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }
