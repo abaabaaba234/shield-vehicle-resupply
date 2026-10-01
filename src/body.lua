@@ -36,7 +36,7 @@ local C = {
     tires          = true,   -- FRV：用 VehicleApi 恢复完好轮胎参数和爆胎标志；模型不重建
     wheel_interval = 2.0,    -- 每辆 FRV 至多每隔这些秒修一个轮胎
     part_repair    = true,   -- 调用游戏维修函数处理已毁部位；整车接口要求所有部位均未禁用
-    exo_leg_fix    = true,   -- 机甲修满后恢复 0.75 移速倍率，并停止已确认的腿部火焰
+    exo_leg_fix    = true,   -- 机甲修满后恢复移速、残留跛行动画和腿部火焰
     exo_weapon_guard = true, -- 非盾牌武器：1HP 故障锁存；修复严格超过 5% 后恢复使用
     exo_shield_guard = true, -- 大盾机甲：手臂/盾面任一区到 1HP，仅禁用盾击
     frv_tire_guard  = true,  -- 轮胎保留模型，1HP 后施加物理爆胎状态
@@ -1203,6 +1203,12 @@ local function repair_parts(v, zones, data, rate, dt, key, cfg)
             and reason ~= 'no recognized leg fire pair' and reason ~= 'exosuit is not fully repaired') then
             report('exo leg fire skip', tostring(fire_ok and reason or stopped))
         end
+        local gait_ok, sent, gait_reason = pcall(REPAIR.fix_gait, d, cfg, zones, config_address, S.clock)
+        if gait_ok and sent then changed = changed + 1
+        elseif not gait_ok or (gait_reason and gait_reason ~= 'no limp animation state'
+            and gait_reason ~= 'gait event pending' and gait_reason ~= 'exosuit is not fully repaired') then
+            report('exo gait skip', tostring(gait_ok and gait_reason or sent))
+        end
     end
     if C.tires and v.kind == 'frv' and S.clock >= (v.next_wheel or 0) then
         v.next_wheel = S.clock + math.max(0.5, C.wheel_interval)
@@ -1751,9 +1757,9 @@ local function cmd_status()
     log('status: enabled=%s heal=%s test=%s native=%s weapon=%s vehicles=%d weapons=%d shields_cfg=%d shields_live=%d native_open=%d forced=%d writes=%d fails=%d',
         tostring(C.enabled), C.heal, tostring(C.test), tostring(N.ready), tostring(N.weapon_ready), #S.vehicles, #S.weapons, n, #S.shields,
         ncfg, W.forced or 0, W.writes, W.fails)
-    log('status: part_repair=%s exo_leg_fix=%s legs_fixed=%d leg_fires_stopped=%d health_guard=%s stat_guard=%s attach_guard=%s effect_guard=%s',
-        tostring(C.part_repair), tostring(C.exo_leg_fix), REPAIR.legs_fixed, REPAIR.leg_fires_stopped,
-        tostring(REPAIR.health_status), tostring(REPAIR.stats_status), tostring(REPAIR.attach_status), tostring(REPAIR.effects_status))
+    log('status: part_repair=%s exo_leg_fix=%s legs_fixed=%d leg_fires_stopped=%d gait_events=%d health_guard=%s stat_guard=%s attach_guard=%s effect_guard=%s animation_guard=%s',
+        tostring(C.part_repair), tostring(C.exo_leg_fix), REPAIR.legs_fixed, REPAIR.leg_fires_stopped, REPAIR.gait_events,
+        tostring(REPAIR.health_status), tostring(REPAIR.stats_status), tostring(REPAIR.attach_status), tostring(REPAIR.effects_status), tostring(REPAIR.animations_status))
     FAULT.status()
     TYRE.status()
     for _, d in ipairs(S.shields) do log('  shield %s ent=%d goid=%d at %s', d.resource, d.entity, d.goid, fmtpos(position_of(d))) end
@@ -1981,5 +1987,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.24 (修正原生特效资源表容量；修满后恢复移速并停止腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.25 (修满后恢复移速、跛行动画和腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

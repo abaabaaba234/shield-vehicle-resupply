@@ -6,7 +6,7 @@
 """
 import os, subprocess, sys
 
-VERSION = 'v0.24'
+VERSION = 'v0.25'
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src = os.path.join(root, 'src')
 dist = os.path.join(root, 'dist')

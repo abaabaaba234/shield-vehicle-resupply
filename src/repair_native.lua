@@ -3,7 +3,7 @@
 -- It never scans or patches executable pages. All calls run in the game's Lua update.
 return function(N, log)
     local ffi = require('ffi')
-    local R = { cache = {}, maps = {}, observations = {}, calls = 0, fixed = 0, legs_fixed = 0, leg_fires_stopped = 0, next_check = 0 }
+    local R = { cache = {}, maps = {}, observations = {}, calls = 0, fixed = 0, legs_fixed = 0, leg_fires_stopped = 0, gait_events = 0, gait_pending = {}, next_check = 0 }
     local exo_types = {['79e4b3d2da5e45e3']=true, ['c2d449ecf7facab1']=true,
         ['7b2326f6fd9c8069']=true, ['35dbf54f016f3624']=true}
     -- Vehicle Supply Tower's known arm resources; upgrades use observed ammo caps.
@@ -28,7 +28,20 @@ return function(N, log)
         stat = {0x9CCAE0, '40 55 3B 15 ?? ?? ?? ?? 4C 8B 15 ?? ?? ?? ?? 49 63 E8 75 ?? B8 FF FF FF FF EB ?? 45 8B 4A 28 33 C9 45 8B 5A 30 48 89 5C 24 10 48 89 74 24 18 44 0F AF DA 41 8D 71 FF 48 89 7C 24 20 45 85 C9 74 ?? 49 8B 5A 20 41 8B 7A 2C 0F 1F 80 00 00 00 00 8B C6 46 8D 04 19 4C 23 C0 42 8B 04 C3 3B C7 74 ?? 3B C2 74 ?? FF C1 41 3B C9 72 ?? B8 FF FF FF FF 48 8B 74 24 18 48 8B 5C 24 10 48 8B 7C 24 20 8B C8 49 8B 42 48 48 6B D1 0D 48 03 D5 F3 0F 11 1C 90 5D C3'},
         attach = {0x4A52B0, '48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 3B 15 ?? ?? ?? ?? 4C 8B 15 ?? ?? ?? ?? 74 ?? 45 8B 4A 20 45 33 C0 41 8B 5A 28 0F AF DA 41 8D 69 FF 45 85 C9 74 ?? 49 8B 7A 18 41 8B 72 24 0F 1F 40 00 66 66 0F 1F 84 00 00 00 00 00 8B C5 41 8D 0C 18 48 23 C8 8B 04 CF 4C 8D 1C CF 3B C6 74 ?? 3B C2 74 ?? 41 FF C0 45 3B C1 72 ?? 32 C0 48 8B 5C 24 08 48 8B 6C 24 10 48 8B 74 24 18 48 8B 7C 24 20 C3 3B C2 75 ?? 41 8B 43 04 83 F8 FF 74 ?? 48 69 C8 ?? ?? ?? ?? 49 8B 42 ?? 83 3C 01 00 0F 95 C0 EB ??'},
     }
+    local animation_code = {
+        {'game.dll', 0x808810, '48895c2418565741574883ec203b15fdb3c702450fb6f9418bf88bda488bf10f8428010000448b415033d2448b5158440fafd34c89742448458d70ff4585c00f84030100004c8b594848896c24408b6954418bc6428d0c124823c8418b04cb4d8d0ccb3bc574103bc37414ffc2413bd072dfe9cc0000003bc30f85c4000000418b410483f8ff0f84b70000004c8d34c500000000488b4660498b0c068b490c85c90f849c000000488b054adab102488b5018488b8220070000ffd084c00f8480000000488b052edab1028bd7488b4818488b46604c8b8150030000498b0c068b490c41ffd085c0745a4584ff7416488b46604533c9448bc7498b0c068b5108e83c4e7d00488b05edd9b1028bd74c8b4018488b4660498b0c068b490c41ff90700300008b442460ffc883f8017715450fb6cf448bc78bd348c7c1feffffffe83d523e00488b6c24404c8b742448488b5c24504883c420415f5f5ec3'},
+        {'game.dll', 0x11234D0, '40574883ec30488bf985d27569895424284533c98854242041b86355119bbaa0000000e8489d0800ba96a83f4a488bcfe86bbb09008b57084533c9488b0dd638200241b8ab1a7850c744242000000000e8eb526efff64714017413f30f101ddd362a014533c08b5708e8a2958affb0014883c4305fc332c04883c4305fc3cccc'},
+        {'game.dll', 0x1123560, '40574883ec30488bf985d27569895424284533c98854242041b86355119bbaa0000000e8b89c0800ba5e34d3a1488bcfe8dbba09008b57084533c9488b0d4638200241b8379334b8c744242000000000e85b526efff64714017413f30f101d4d362a014533c08b5708e812958affb0014883c4305fc332c04883c4305fc3cccc'},
+        {'helldivers2.exe', 0x9D8C0, '48895c24084889742410574883ec20488b351a2897018bd9488d8ed0000000ff157b8e35018bc325ffff3f003b8698000000720433dbeb1c8bc8488b86a0000000c1eb16381c0175eb488b8688000000488b1cc8488d8ed0000000ff15378e3501488b742438488bc3488b5c24304883c4205fc3'},
+        {'helldivers2.exe', 0x201710, '48895c2408574883ec208bfae89fc1e9ff488bc8488bd84c8b0041ff90b00100004885c0750b488b5c24304883c4205fc3488b03488bcbff90b00100008bd7488b4828e8e899ffff488b5c24300fb6c04883c4205fc3'},
+        {'helldivers2.exe', 0x201900, '48895c2408574883ec208bda8bf9e8adbfe9ff448bc38bd7488b4818488b5c24304883c4205fe9d5e3f2ff'},
+        {'helldivers2.exe', 0x12FD00, '48895c240848896c24104889742418574883ec20488bf1418be88bca8bdae89ddbf6ff488bf84885c0744a488b10488bc8ff92b00100004885c075394c8b07488d542448488bcf41ff90b8010000488b4730488b0848894c2448488d4c2448e89c324900488bd0488d0d32b85301e86d194900eb2cb801000000f00fc186380017008bc0486bc858c784318800010003000000899c313800010089ac313c000100488b5c2430488b6c2438488b7424404883c420'},
+        {'helldivers2.exe', 0x1FB140, '4883ec08448b410c4585c07507b0014883c408c3448b59104c03d948891c2433db448bcb0f1f40000f1f840000000000438d0408d1e8413914834d8d14837306448d4801eb057617448bc0453bc177e0'},
+        {'helldivers2.exe', 0x2BD9C0, '488b8178010000c3'},
+        {'helldivers2.exe', 0x1FEEB0, '4883ec28e807eae9ff4885c00f95c04883c428c3cccccccccccccccccccccccc40534883ec20e8e5e9e9ff488bc8488bd8488b10ff523084c07412488b13488b'},
+    }
     local ctypes = {
+        animation_event = 'void (*)(void *, uint32_t, uint32_t, bool, uint32_t)',
         effect_stop = 'void (*)(void *, uint32_t, uint32_t, uint32_t, uint32_t, bool)',
         heal = 'void (*)(void *, uint32_t, float)',
         query = 'uint64_t (*)(uint32_t, uint32_t, void *)',
@@ -169,6 +182,24 @@ return function(N, log)
             and matches(fn + 0x1AD, '41 FF C5 49 83 C7 50 49 83 C4 04 41 83 FD 20'), 'StopEffect replication/32-slot layout')
         return {root=root, fn=fn, tbl=0x20, owners=0x38, rows=0x48, stride=0x218}
     end
+    local function resolve_animation()
+        need(R.exe ~= nil, 'animation engine module unavailable')
+        for _, span in ipairs(animation_code) do
+            local base = span[1] == 'game.dll' and N.base or R.exe.base
+            local pattern = span[3]:gsub('..', '%0 ')
+            need(matches(base + span[2], pattern), 'animation code guard '..span[1]..string.format('+%X', span[2]))
+        end
+        local left, right = N.base + 0x1123560, N.base + 0x11234D0
+        -- Same dispatcher and manager used by both native leg-damage callbacks.
+        local root = rel(left + 0x3B, 3, 7)
+        need(root == N.base + 0x3326DE8 and root == rel(right + 0x3B, 3, 7)
+            and rel(left + 0x50, 1, 5) == N.base + 0x808810
+            and rel(right + 0x50, 1, 5) == N.base + 0x808810, 'animation damage manager differs')
+        local resolver = R.exe.base + 0x9D8C0
+        local units = rel(resolver + 0xF, 3, 7)
+        need(units == R.exe.base + 0x1A100F0, 'animation UnitReference manager differs')
+        return {root=root, fn=N.base+0x808810, api=N.base+0x3326308, units=units}
+    end
     function R.ensure(now)
         if not N.ready then return false end
         if R.base == N.base and now < R.next_check then return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil end
@@ -176,7 +207,7 @@ return function(N, log)
         N.win.begin_sample()
         local exe_ok, exe = pcall(resolve_exe)
         R.exe = exe_ok and exe or nil
-        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach, bash = resolve_bash, effects = resolve_effects}) do
+        for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach, bash = resolve_bash, effects = resolve_effects, animations = resolve_animation}) do
             local ok, value = pcall(resolve)
             R[name] = ok and value or nil
             local status = ok and 'ok' or tostring(value)
@@ -272,7 +303,7 @@ return function(N, log)
         g:validate()
         return pd, why, chain
     end
-    -- Shared fresh proof for movement and particle repairs; never trust a cached full snapshot.
+    -- Shared fresh proof for speed, gait and particles; never trust a cached full snapshot.
     local function fully_repaired(d, cfg, zones, config_address)
         if not exo_types[d.resource] then return nil, 'not an exosuit' end
         local g, hm, rec = owner_graph(d)
@@ -384,6 +415,115 @@ return function(N, log)
             end
         end
         return false, 'no active leg fire'
+    end
+    local FINE, LEFT_LIMP, RIGHT_LIMP = 0xBDF3A6A1, 0xB8349337, 0x50781AAB
+    local function animation_access(d, cfg, zones, config_address)
+        local g, why = fully_repaired(d, cfg, zones, config_address)
+        if not g then return nil, why end
+        local a = R.animations
+        local manager = N.ptr(g:watch(a.root, 8), 0)
+        local row, owner = g:component(manager, d.entity, 0x48, 0x60)
+        need(row ~= nil and N.same(owner, d) and owner.flags % 2 == 1, 'animation owner changed')
+        local api = N.ptr(g:watch(a.api, 8), 0)
+        api = N.ptr(g:watch(api + 0x18, 8), 0)
+        for slot, rva in pairs({[0x350]=0x201710, [0x370]=0x201900, [0x720]=0x1feeb0}) do
+            need(N.ptr(g:watch(api + slot, 8), 0) == R.exe.base + rva, 'animation Unit API differs')
+        end
+        local units = N.ptr(g:watch(a.units, 8), 0)
+        local index = d.unit % 0x400000
+        need(index < N.u32(g:watch(units + 0x98, 4), 0), 'animation Unit index')
+        local generations = N.ptr(g:watch(units + 0xA0, 8), 0)
+        need(g:watch(generations + index, 1):byte(1) == math.floor(d.unit / 0x400000) % 256, 'animation Unit generation changed')
+        local objects = N.ptr(g:watch(units + 0x88, 8), 0)
+        local object = N.ptr(g:watch(objects + index * 8, 8), 0)
+        local vtable = N.ptr(g:watch(object, 8), 0)
+        need(N.ptr(g:watch(vtable + 0x1B0, 8), 0) == R.exe.base + 0x2BD9C0, 'animation getter differs')
+        local controller = N.ptr(g:watch(object + 0x178, 8), 0)
+        need(N.ptr(g:watch(controller, 8), 0) == object, 'animation controller owner changed')
+        local definition = N.ptr(g:watch(controller + 0x28, 8), 0)
+        local header = g:watch(definition, 0x14)
+        need(N.u32(header, 0) == 0x1B, 'animation definition version')
+        local count, offset = N.u32(header, 4), N.u32(header, 8)
+        need(count > 0 and count <= 32 and offset == 0x50, 'animation graph count/layout')
+        local ec, eo = N.u32(header, 12), N.u32(header, 16)
+        need(ec > 0 and ec <= 256 and eo >= 0x50 and eo < 0x40000, 'animation event list bounds')
+        local events, has_fine = g:watch(definition + eo, ec * 4), false
+        for i = 0, ec - 1 do if N.u32(events, i*4) == FINE then has_fine = true end end
+        need(has_fine, 'animation has no fine event')
+        local sizes = g:watch(controller + 0x48, 8)
+        need(N.u32(sizes, 0) == count and N.u32(sizes, 4) >= count and N.u32(sizes, 4) <= 64, 'animation state count')
+        local active = N.ptr(g:watch(controller + 0x50, 8), 0)
+        active = g:watch(active, count * 8)
+        local nodes = g:watch(definition + offset, 4 + count * 4)
+        need(N.u32(nodes, 0) == count, 'animation graph table count')
+        local damaged = 0
+        for i = 0, count - 1 do
+            local no = N.u32(nodes, 4 + i*4)
+            need(no >= 4 + count*4 and no < eo - offset, 'animation node bounds')
+            local node = definition + offset + no
+            local limit = i+1 < count and definition + offset + N.u32(nodes, 8+i*4) or definition + eo
+            need(limit > node and limit <= definition + eo, 'animation node ordering')
+            local sc = N.u32(g:watch(node + 8, 4), 0)
+            need(sc > 0 and sc <= 64, 'animation node state count')
+            local state_offsets = g:watch(node + 12, sc*4)
+            local state = N.ptr(active, i*8)
+            local state_index
+            local function state_at(j)
+                need(j >= 0 and j < sc, 'animation transition state index')
+                local p = node + N.u32(state_offsets, j*4)
+                need(p >= node+12+sc*4 and p+0x38 <= limit, 'animation state bounds')
+                return p
+            end
+            for j = 0, sc - 1 do if state_at(j) == state then state_index = j end end
+            need(state_index ~= nil, 'animation active state outside graph')
+            local function transitions(p)
+                local h = g:watch(p+0x28, 16)
+                local n, off, tn, to = N.u32(h,0), N.u32(h,4), N.u32(h,8), N.u32(h,12)
+                need(n <= 64 and tn <= 64, 'animation transition count')
+                if n == 0 then return {} end
+                need(off >= 0x38 and p+off+n*8 <= limit and to >= 0x38 and p+to+tn*16 <= limit, 'animation transition bounds')
+                local ev, tr, result = g:watch(p+off,n*8), g:watch(p+to,tn*16), {}
+                for j = 0, n - 1 do
+                    local name, k = N.u32(ev,j*8), N.u32(ev,j*8+4)
+                    need(k < tn and result[name] == nil, 'animation event transition index')
+                    local target = N.u32(tr,k*16)
+                    need(target < sc, 'animation transition destination')
+                    result[name] = target
+                end
+                return result
+            end
+            local current = transitions(state)
+            if current[FINE] ~= nil then
+                local normal = transitions(state_at(current[FINE]))
+                -- Verify the actual inverse of a leg-damage transition. Other
+                -- graph states with an unrelated fine event are left alone.
+                if normal[LEFT_LIMP] == state_index or normal[RIGHT_LIMP] == state_index then damaged = damaged + 1 end
+            end
+        end
+        return {g=g,manager=manager,controller=controller,definition=definition,damaged=damaged}
+    end
+    function R.fix_gait(d, cfg, zones, config_address, now)
+        if not R.animations then return false, R.animations_status end
+        local a, why = animation_access(d, cfg, zones, config_address)
+        if not a then return false, why end
+        local key = d.entity..':'..d.unit..':'..d.goid..':'..d.resource
+        if a.damaged == 0 then
+            a.g:validate()
+            if R.gait_pending[key] then
+                R.gait_pending[key] = nil
+                log('exo gait state normal %s ent=%d (animation readback)', d.resource, d.entity)
+            end
+            return false, 'no limp animation state'
+        end
+        local pending = R.gait_pending[key]
+        if pending and pending.controller == a.controller and now < pending.next_try then return false, 'gait event pending' end
+        a.g:validate()
+        need(rq(R.animations.root) == a.manager, 'animation manager changed')
+        R.invoke('animation_event', R.animations.fn, pointer(a.manager), d.entity, FINE, false, 1)
+        R.gait_events = R.gait_events + 1
+        R.gait_pending[key] = {controller=a.controller,next_try=now+2}
+        log('exo gait event sent %s ent=%d states=%d event=fine (native animation)', d.resource, d.entity, a.damaged)
+        return true
     end
     local function wheel_access(d)
         need(R.wheels ~= nil, R.wheels_status or 'wheel interface unavailable')
@@ -579,7 +719,8 @@ return function(N, log)
         end
         return false, missing and 'missing intact sample for damaged wheel' or 'no selected blown tyre'
     end
-    function R.reset() R.cache, R.maps, R.observations = {}, {}, {}; functions = {} end
-    R.signatures = signatures -- read-only metadata used by offline guard tests
+    function R.reset() R.cache, R.maps, R.observations, R.gait_pending = {}, {}, {}, {}; functions = {} end
+    R.signatures = signatures
+    if rawget(_G, "__SVR_TEST") then R.resolve_animation = resolve_animation end -- read-only metadata used by offline guard tests
     return R
 end
