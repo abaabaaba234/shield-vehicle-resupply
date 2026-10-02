@@ -33,6 +33,8 @@ v0.19 根据运行中机甲的只读采样修正挂接解析：Attachable 保存
 游戏版本需要和 DRIVER HUD 1.4.5 / HUD 1.11.1 一致（Steam build 25480438）。版本不对时，内置的代码特征校验会失败，mod 自动停用，**不会写任何内存**。
 
 ## 设置与命令
+本仓库当前构建版本为 `v0.25-menu`，支持 **ModOptionsMenu API 1 / version 2** 的 27 项参数控件。另装参数菜单模组后打开 **Esc → MODS → 护盾载具回血补弹**。第一行 Language 可选择简体汉字／English，应用后关闭并重新打开 Esc 菜单刷新文字。修改会保存到原设置文件；没有菜单也可继续使用文件与命令。安装、范围及验证见 [MODS 菜单说明](docs/MODS菜单.md)，源码与构建布局见 [仓库说明](docs/REPOSITORY.md)。Bingus Shared Loader 和 ModOptionsMenu 参数菜单各自独立。
+
 文件都在 `%LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\`：
 - `shield_resupply_settings.txt`：设置，第一次运行时自动生成。改完后发 `reload`。
 - `shield_resupply_cmd.txt`：往里写命令，每行一条，0.5 秒内执行。

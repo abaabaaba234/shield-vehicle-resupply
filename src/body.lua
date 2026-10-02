@@ -20,6 +20,7 @@ local u32, i32, ptr, hex64, same = N.u32, N.i32, N.ptr, N.hex64, N.same
 -- 配置（可被 Logs/shield_resupply_settings.txt 覆盖，见 load_settings）
 -- ---------------------------------------------------------------------------
 local C = {
+    language       = 'zh',   -- MODS 页仅本模组的显示语言
     enabled        = true,
     tick           = 0.5,    -- 秒（v0.10：0.25 -> 0.5）
     roster_every   = 3.0,    -- 重新遍历组件表/找护盾的间隔（秒）
@@ -161,13 +162,14 @@ local function read_settings()
         if f then
             f:write('# Shield Vehicle Resupply 设置。改完在 shield_resupply_cmd.txt 写 reload\n',
                 '# shield=<16位hex> 可写多行；weapon=<hex> 同理；ammo_max=<hex>:<字段>=<数值>\n',
-                'radius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=1\nwheel_interval=2\npart_repair=1\nexo_leg_fix=1\nexo_weapon_guard=1\nexo_shield_guard=1\nfrv_tire_guard=1\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
+                'language=zh\nenabled=1\nradius=14.5\nshield_duration=45\nspot=0\ntest=0\nrevive=0\nnet_heal=1\nhull_zones=1\ntires=1\nwheel_interval=2\npart_repair=1\nexo_leg_fix=1\nexo_weapon_guard=1\nexo_shield_guard=1\nfrv_tire_guard=1\nammo=1\nexo_heal=0.04\ntank_heal=0.03\nfrv_heal=0.05\n',
                 'ammo_rate=0.10\ncooldown=2\nauthority_only=1\nheal=native\nnative_zone=0x141\npart_regen=1\nnative_segments=1\nnative_force=1\n',
                 '# part=<16位资源hash>:<8位部位hash>=0|1，可写多行；parts 命令列出这些 hash\n')
             f:close()
         end
         return
     end
+    C.language = 'zh' -- Old files without a language field keep their business settings.
     C.shield, C.weapon, C.ammo_max, C.part = { ['ed13ddc480ec6910'] = true }, {}, {}, {}
     for line in f:lines() do
         line = line:gsub('^\239\187\191', ''):gsub('#.*', ''):gsub('%s', '')
@@ -182,6 +184,8 @@ local function read_settings()
             local res, zone, enabled = v:lower():match('^(%x+):(%x+)=([01])$')
             if res and #res == 16 and #zone == 8 then C.part[res .. ':' .. zone] = enabled == '1'
             else log('invalid part setting: %s', tostring(v)) end
+        elseif k == 'language' then
+            if v == 'zh' or v == 'en' then C.language = v end
         elseif k == 'heal' then
             local m = v:lower()
             if m == 'native' or m == 'write' or m == 'off' then C.heal = m end
@@ -204,6 +208,33 @@ local function read_settings()
     log('settings: exo_shield_guard=%s frv_tire_guard=%s',tostring(C.exo_shield_guard),tostring(C.frv_tire_guard))
 end
 local function load_settings() read_settings(); rebuild_res() end
+
+local function save_setting(key, value)
+    -- Replace only the applied key. Preserve repeated hash/part overrides,
+    -- unknown settings, comments and other values from the original file.
+    local f, reason = io.open(SET, 'rb')
+    if not f then return false, reason end
+    local source = f:read('*a'); f:close()
+    if not source then return false, 'cannot read settings' end
+    local encoded = type(value) == 'boolean' and (value and '1' or '0') or tostring(value)
+    local lines, found = {}, false
+    for line in (source:gsub('^\239\187\191',''):gsub('\r\n','\n')..'\n'):gmatch('(.-)\n') do
+        local current = line:match('^%s*([%w_]+)%s*=')
+        if current == key then
+            line = key..'='..encoded..(line:match('(%s*#.*)$') or '')
+            found = true
+        end
+        lines[#lines+1] = line
+    end
+    if lines[#lines] == '' then lines[#lines] = nil end
+    if not found then lines[#lines+1] = key..'='..encoded end
+    f, reason = io.open(SET, 'wb')
+    if not f then return false, reason end
+    local wrote, write_reason = f:write(table.concat(lines,'\n')..'\n')
+    local closed, close_reason = f:close()
+    if not wrote or not closed then return false, write_reason or close_reason end
+    return true
+end
 
 -- ---------------------------------------------------------------------------
 -- 写内存：只写 PAGE_READWRITE 的已提交页；写前比对旧值，写后读回
@@ -1975,10 +2006,23 @@ local function tick(dt)
 end
 
 load_settings()
+local MENU = ModsMenu.new{
+    get_config=function() return C end,
+    save_setting=save_setting,
+    request_apply=function(key)
+        -- Reuse reload/off restoration, including write-failure retries.
+        native_close_all('menu '..key); FAULT.close(); TYRE.close()
+        S.acc=C.tick; S.next_roster=0
+    end,
+    log=log,
+}
 if TEST_HOOK then TEST_HOOK(N, W, S, C, REPAIR, FAULT, TYRE) end
 local previous = rawget(_G, 'update')
+local menu_clock = 0
 rawset(_G, 'update', function(dt, ...)
     if type(dt) == 'number' and dt > 0 and dt < 1 then
+        menu_clock=menu_clock+dt
+        MENU.step(menu_clock) -- Also available on the ship, with native guards closed, or while disabled.
         local ok, err = pcall(tick, dt)
         if not ok then
             S.errors = (S.errors or 0) + 1
@@ -1987,5 +2031,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.25 (修满后恢复移速、跛行动画和腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.25-menu (中英 MODS 参数菜单；修满后恢复移速、跛行动画和腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

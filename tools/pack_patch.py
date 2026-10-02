@@ -4,6 +4,7 @@
 每个 lua 文件第一行必须是 "-- HD2-Addon: mods/<a>/<b>"，资源名 hash = murmur64("mods/<a>/<b>")。
 格式照抄 Bingus Shared Loader v17 自己的 patch_0（1 个类型、每个文件一条 80 字节记录）。"""
 import struct, sys, zipfile, json, uuid, hashlib
+from pathlib import Path
 
 M = 0xFFFFFFFFFFFFFFFF
 def murmur64(key, seed=0):
@@ -51,7 +52,7 @@ def main():
     patch, files = build_patch(sources)
     manifest = {
         "Version": 1, "Guid": str(uuid.uuid5(uuid.NAMESPACE_URL, 'hd2-shieldresupply-' + name)),
-        "Name": name, "Description": "Requires Bingus Shared Loader v17. Addons: " + ', '.join(f[1] for f in files),
+        "Name": name, "Description": "Based on v0.25. Requires Bingus Shared Loader v17+. Optional bilingual settings: ModOptionsMenu API 1/version 2. Addons: " + ', '.join(f[1] for f in files),
         "Options": [{"Name": name, "Description": "Enable " + name, "Include": ["data"]}],
     }
     with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -59,6 +60,7 @@ def main():
         z.writestr('data/9ba626afa44a3aa3.patch_0', patch)
         z.writestr('data/9ba626afa44a3aa3.patch_0.stream', b'')
         z.writestr('data/9ba626afa44a3aa3.patch_0.gpu_resources', b'')
+        z.writestr('INSTALL_菜单说明.md', (Path(__file__).resolve().parents[1]/'docs/MODS菜单.md').read_bytes())
     for h, p, blob in files: print(f'{h:016x}  {p}  ({len(blob)} bytes)')
     print('patch', len(patch), 'bytes, sha256', hashlib.sha256(patch).hexdigest().upper(), '->', out)
 

@@ -6,7 +6,7 @@
 """
 import os, subprocess, sys
 
-VERSION = 'v0.25'
+VERSION = 'v0.25-menu'
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src = os.path.join(root, 'src')
 dist = os.path.join(root, 'dist')
@@ -33,6 +33,9 @@ out = '\n'.join([
     'end)()',
     'local TyreFault=(function()',
     read('tyre_fault.lua'),
+    'end)()',
+    'local ModsMenu=(function()',
+    read('mods_menu.lua'),
     'end)()',
     read('body.lua'),
 ])
