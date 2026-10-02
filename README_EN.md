@@ -27,6 +27,8 @@ v0.19 corrects attachment parsing using a read-only capture from a running mech.
 The mod targets the same game build as DRIVER HUD 1.4.5 / HUD 1.11.1 (Steam build 25480438). On any other build, the code-guard check fails and the mod disables itself **without writing memory**.
 
 ## Settings and commands
+The current build is `v0.25-menu`, based on v0.25, with 27 controls for **ModOptionsMenu API 1 / version 2**. Install the options-menu mod separately, then open **Esc > MODS > Shield Vehicle Resupply**. The first row, Language, selects Simplified Chinese or English; apply, then close and reopen Esc to refresh text. Applied edits persist in the original settings file. Existing commands and file settings work without the menu. See [menu details and ranges](docs/MODS菜单.md) and [repository layout](docs/REPOSITORY.md). The shared loader and ModOptionsMenu options provider are separate mods.
+
 All files are in `%LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\`:
 - `shield_resupply_settings.txt`: settings. The mod creates it on first run. Send `reload` after you edit it.
 - `shield_resupply_cmd.txt`: commands, one per line. Each runs within 0.5 s.

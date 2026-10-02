@@ -1,0 +1,29 @@
+{
+  "base": "v0.25",
+  "base_commit": "72ee8b45fb653c84cbe02456394882bfc0361df8",
+  "menu_controls": 27,
+  "tests_passed": [
+    "native_guard_test",
+    "native_heal_test",
+    "part_regen_test",
+    "repair_native_test",
+    "exo_repair_test",
+    "exo_leg_effect_test",
+    "exo_gait_test",
+    "weapon_fault_test",
+    "shield_fault_test",
+    "tyre_fault_test",
+    "svr_test",
+    "mods_menu_test"
+  ],
+  "real_provider_source": "HD2_MOD_OPTIONS_MENU_SOURCE or sibling eruptor-original-shrapnel/research/references/mod_options_menu_9ba626afa44a3aa3.patch_15.lua",
+  "in_game_tested": false,
+  "original_artifact_sha256": {
+    "ShieldVehicleResupply_v0.25.zip": "e0b4f9dc7a9b64a10fbfbe95f2b1ec43f9d8221a856bc03872ad29697a0babe7"
+  },
+  "outputs": {
+    "ShieldVehicleResupply_v0.25-menu.zip": "ca5e91f182567be89d8bf20de8e0c2f50273071bdfb97c33f4ce92ba80b7b473",
+    "shield_vehicle_resupply.lua": "ccb4b9f5cd98b297a5f02b6ffce0cc40cd20e87c5343008018ffcc27a8b9a2bd"
+  },
+  "build_version": "v0.25-menu"
+}
