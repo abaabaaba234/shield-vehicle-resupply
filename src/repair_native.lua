@@ -203,17 +203,29 @@ return function(N, log)
     function R.ensure(now)
         if not N.ready then return false end
         if R.base == N.base and now < R.next_check then return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil end
+        local force = R.next_check == 0
+        local handle = kernel_ok and kernel.GetModuleHandleA('helldivers2.exe') or nil
+        local exe_base = handle ~= nil and tonumber(ffi.cast('uintptr_t', handle)) or nil
+        if R.base ~= N.base or R.exe_base ~= exe_base then
+            for _, name in ipairs({'health','wheels','stats','attach','bash','effects','animations'}) do R[name]=nil end
+            R.exe=nil; functions={}
+        end
+        R.exe_base=exe_base
         R.base, R.next_check = N.base, now + 10
         N.win.begin_sample()
-        local exe_ok, exe = pcall(resolve_exe)
-        R.exe = exe_ok and exe or nil
+        if force or not R.exe then
+            local exe_ok, exe = pcall(resolve_exe)
+            R.exe = exe_ok and exe or nil
+        end
         for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach, bash = resolve_bash, effects = resolve_effects, animations = resolve_animation}) do
-            local ok, value = pcall(resolve)
-            R[name] = ok and value or nil
-            local status = ok and 'ok' or tostring(value)
-            if R[name .. '_status'] ~= status then
-                R[name .. '_status'] = status
-                log('repair native %s: %s', name, status)
+            if force or not R[name] then
+                local ok, value = pcall(resolve)
+                R[name] = ok and value or nil
+                local status = ok and 'ok' or tostring(value)
+                if R[name .. '_status'] ~= status then
+                    R[name .. '_status'] = status
+                    log('repair native %s: %s', name, status)
+                end
             end
         end
         return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil
@@ -296,15 +308,24 @@ return function(N, log)
         R.invoke('heal', R.health.fn, pointer(hm), d.entity, fraction)
         return true
     end
-    function R.arm_parent(d, graph)
+    function R.arm_parent(d, graph, defer_validation)
         need(R.arm_types[d.resource], 'unsupported arm resource')
         local g = graph or owner_graph(d)
         local pd, why, chain = mounted_parent(g, d)
-        g:validate()
+        -- Guard service validates the combined arm/parent graph before its first edit.
+        if not graph or not defer_validation then g:validate() end
         return pd, why, chain
     end
     -- Shared fresh proof for speed, gait and particles; never trust a cached full snapshot.
-    local function fully_repaired(d, cfg, zones, config_address)
+    local function fully_repaired(d, cfg, zones, config_address, proof)
+        if proof then
+            need(N.same(proof.d,d) and proof.cfg==cfg and proof.zones==zones and proof.base==N.base, 'leg proof owner changed')
+            local g=N.graph(N.win.read,N.base)
+            for key,raw in pairs(proof.g.seen) do g.seen[key]=raw end
+            for i,w in ipairs(proof.g.watches) do g.watches[i]=w end
+            g.calls,g.bytes=proof.g.calls,proof.g.bytes
+            return g
+        end
         if not exo_types[d.resource] then return nil, 'not an exosuit' end
         local g, hm, rec = owner_graph(d)
         need(config_address(g, g:root('network'), hm, d) == cfg, 'leg Health config owner changed')
@@ -331,10 +352,15 @@ return function(N, log)
         if count < 38 then need(N.u32(g:watch(cfg + 0x208 + count * 0x228 + 0x60, 4), 0) == 0, 'incomplete leg zone list') end
         return g
     end
+    function R.leg_proof(d,cfg,zones,config_address)
+        local g,why=fully_repaired(d,cfg,zones,config_address)
+        if not g then return nil,why end
+        return {g=g,d=d,cfg=cfg,zones=zones,base=N.base}
+    end
     -- The first float in the guarded 13-float StatModifier row is movement speed.
-    function R.fix_leg(d, cfg, zones, write_float, config_address)
+    function R.fix_leg(d, cfg, zones, write_float, config_address, proof)
         if not R.stats then return false, R.stats_status end
-        local g, why = fully_repaired(d, cfg, zones, config_address)
+        local g, why = fully_repaired(d, cfg, zones, config_address, proof)
         if not g then return false, why end
         local sm = N.ptr(g:watch(R.stats.root, 8), 0)
         local row = g:lookup(g:table(sm + R.stats.tbl), d.entity)
@@ -349,8 +375,9 @@ return function(N, log)
         return true
     end
     local leg_fire = {['a1d3345e']='2b57c939', ['4a3fa896']='a5bfa032'}
-    local function effect_access(d, cfg, zones, config_address)
-        local g, why = fully_repaired(d, cfg, zones, config_address)
+    R.effect_cache = {}
+    local function effect_access(d, cfg, zones, config_address, proof)
+        local g, why = fully_repaired(d, cfg, zones, config_address, proof)
         if not g then return nil, why end
         local fx = R.effects
         local manager = N.ptr(g:watch(fx.root, 8), 0)
@@ -362,37 +389,57 @@ return function(N, log)
         local settings = N.ptr(g:watch(net + 0xF127B8, 8), 0)
         -- Keep the native constant: 0x560 is 1376 (not 1360).
         local count = 0x560
-        local start, ecfg = N.mod64hex(d.resource, count), nil
-        for step = 0, 63 do
-            local entry = g:watch(settings + ((start + step) % count) * 16, 16)
-            local resource = N.hex64(entry, 0)
-            if resource == d.resource then
+        local cached = R.effect_cache[d.resource]
+        local start, ecfg, slot = N.mod64hex(d.resource, count), nil, nil
+        if cached and cached.settings == settings then
+            local entry = g:watch(cached.slot, 16)
+            if N.hex64(entry, 0) == d.resource then
                 local index = N.u32(entry, 8)
                 need(index < count, 'EffectReference settings index')
-                ecfg = settings + 0x5600 + index * 0xF48; break
-            elseif resource == '0000000000000000' then break end
-        end
-        need(ecfg ~= nil, 'no EffectReference configuration')
-        local particles, found = {}, {}
-        for i = 0, 31 do
-            local setting = g:watch(ecfg + 8 + i * 80, 80)
-            local name = string.format('%08x', N.u32(setting, 48))
-            if leg_fire[name] then
-                need(not found[name], 'duplicate leg fire name'); found[name] = true
-                need(N.hex64(setting, 0) == '1b9236a0c8137ed1'
-                    and string.format('%08x', N.u32(setting, 32)) == leg_fire[name]
-                    and N.u32(setting, 68) == 2, 'leg fire configuration differs')
-                particles[#particles + 1] = {name=N.u32(setting,48), at=rows + i*4}
+                ecfg, slot = settings + 0x5600 + index * 0xF48, cached.slot
             end
         end
-        if #particles ~= 2 then return nil, 'no recognized leg fire pair' end
+        if not ecfg then
+            for step = 0, 63 do
+                local at = settings + ((start + step) % count) * 16
+                local entry = g:watch(at, 16)
+                local resource = N.hex64(entry, 0)
+                if resource == d.resource then
+                    local index = N.u32(entry, 8)
+                    need(index < count, 'EffectReference settings index')
+                    ecfg, slot = settings + 0x5600 + index * 0xF48, at; break
+                elseif resource == '0000000000000000' then break end
+            end
+        end
+        need(ecfg ~= nil, 'no EffectReference configuration')
+        local raw = g:watch(ecfg + 8, 32 * 80)
+        if not cached or cached.cfg ~= ecfg or cached.raw ~= raw then
+            local specs, found = {}, {}
+            for i = 0, 31 do
+                local setting = raw:sub(i * 80 + 1, (i + 1) * 80)
+                local name = string.format('%08x', N.u32(setting, 48))
+                if leg_fire[name] then
+                    need(not found[name], 'duplicate leg fire name'); found[name] = true
+                    need(N.hex64(setting, 0) == '1b9236a0c8137ed1'
+                        and string.format('%08x', N.u32(setting, 32)) == leg_fire[name]
+                        and N.u32(setting, 68) == 2, 'leg fire configuration differs')
+                    specs[#specs + 1] = {name=N.u32(setting,48), offset=i*4}
+                end
+            end
+            if #specs ~= 2 then return nil, 'no recognized leg fire pair' end
+            cached = {settings=settings,slot=slot,cfg=ecfg,raw=raw,specs=specs}
+            R.effect_cache[d.resource] = cached
+            R.effect_scans = (R.effect_scans or 0) + 1
+        end
+        local particles = {}
+        for _, spec in ipairs(cached.specs) do particles[#particles+1]={name=spec.name,at=rows+spec.offset} end
         return {g=g, manager=manager, cfg=ecfg, particles=particles}
     end
-    function R.stop_leg_fire(d, cfg, zones, config_address)
+    function R.stop_leg_fire(d, cfg, zones, config_address, proof)
         if not R.effects then return false, R.effects_status end
         -- Stop one active leg effect per service. Reacquire ownership/health on
         -- the next service, including when movement speed is already normal.
-        local a, why = effect_access(d, cfg, zones, config_address)
+        local a, why = effect_access(d, cfg, zones, config_address, proof)
         if not a then return false, why end
         for _, particle in ipairs(a.particles) do
             if N.u32(a.g:watch(particle.at, 4), 0) ~= 0 then
@@ -417,8 +464,8 @@ return function(N, log)
         return false, 'no active leg fire'
     end
     local FINE, LEFT_LIMP, RIGHT_LIMP = 0xBDF3A6A1, 0xB8349337, 0x50781AAB
-    local function animation_access(d, cfg, zones, config_address)
-        local g, why = fully_repaired(d, cfg, zones, config_address)
+    local function animation_access(d, cfg, zones, config_address, proof)
+        local g, why = fully_repaired(d, cfg, zones, config_address, proof)
         if not g then return nil, why end
         local a = R.animations
         local manager = N.ptr(g:watch(a.root, 8), 0)
@@ -502,9 +549,9 @@ return function(N, log)
         end
         return {g=g,manager=manager,controller=controller,definition=definition,damaged=damaged}
     end
-    function R.fix_gait(d, cfg, zones, config_address, now)
+    function R.fix_gait(d, cfg, zones, config_address, now, proof)
         if not R.animations then return false, R.animations_status end
-        local a, why = animation_access(d, cfg, zones, config_address)
+        local a, why = animation_access(d, cfg, zones, config_address, proof)
         if not a then return false, why end
         local key = d.entity..':'..d.unit..':'..d.goid..':'..d.resource
         if a.damaged == 0 then
@@ -525,13 +572,14 @@ return function(N, log)
         log('exo gait event sent %s ent=%d states=%d event=fine (native animation)', d.resource, d.entity, a.damaged)
         return true
     end
+    local query_buffer,wheel_buffer=ffi.new('uint8_t[128]'),ffi.new('uint8_t[48]')
     local function wheel_access(d)
         need(R.wheels ~= nil, R.wheels_status or 'wheel interface unavailable')
         owner(d)
         local query_table = rq(R.wheels.query)
         local query = query_table and rq(query_table)
         need(query and in_engine(query), 'wheel query function unavailable')
-        local buffer = ffi.new('uint8_t[128]')
+        local buffer=query_buffer;ffi.fill(buffer,128)
         R.invoke('query', query, d.unit, 16, buffer)
         local handle_ptr = N.ptr(ffi.string(buffer, 128), 0x20)
         need(handle_ptr >= 65536, 'vehicle handle unavailable')
@@ -563,31 +611,48 @@ return function(N, log)
         return {h = h, get = get, set = set,header=header}
     end
     local function get_wheel(a, index)
-        local b = ffi.new('uint8_t[48]')
+        local b=wheel_buffer;ffi.fill(b,48)
         if tonumber(R.invoke('get', a.get, a.h, index, b)) == 0 then return nil end
         local s = ffi.string(b, 48)
         return s:byte(0x29) <= 1 and s or nil
     end
     -- Runtime VRW centres identify physical wheels independently of Health order.
     -- Only the two known FRV resources and the captured axle/centre schema qualify.
-    function R.tyre_snapshot(d)
+    R.wheel_layouts={}
+    function R.tyre_snapshot(d,indices)
         need(d.resource=='9b2140378640432e' or d.resource=='cc21c7ffd3ebefb9','unsupported tyre resource')
-        local a=wheel_access(d); local map,seen,values={},{},{}
+        local a=wheel_access(d); local values,raws={},{}
+        local header=read(a.header,24);need(header,'wheel resource offsets unreadable')
         for i=0,3 do
-            local off=r32(a.header+8+i*4)
+            local off=N.u32(header,8+i*4)
             need(off and off>=24 and off<=0x10000,'wheel resource offset')
-            local raw=read(a.header+off,24);need(raw,'wheel centre unreadable')
-            local f=ffi.new('float[3]');ffi.copy(f,raw:sub(13,24),12)
-            local x,y,z=tonumber(f[0]),tonumber(f[1]),tonumber(f[2])
-            local axle,steered=N.u32(raw,0),N.u32(raw,4)
-            need(x==x and y==y and z==z and math.abs(x)>=0.5 and math.abs(x)<=3
-                and math.abs(y)>=0.5 and math.abs(y)<=4 and math.abs(z)<=1,'unknown FRV wheel centre')
-            need((axle==1 and steered==0 and y>0) or (axle==2 and steered==1 and y<0),'unknown FRV axle layout')
-            local hash=y>0 and (x<0 and 'fed0a478' or 'f3cb00ad') or (x<0 and 'c6bf05a9' or 'f12186b7')
-            need(not seen[hash],'duplicate FRV wheel location');seen[hash]=true;map[i]=hash
-            values[i]=get_wheel(a,i);need(values[i],'wheel parameters unavailable')
+            raws[i+1]=read(a.header+off,24);need(raws[i+1],'wheel centre unreadable')
         end
-        return {h=a.h,map=map,values=values}
+        local signature=header..table.concat(raws)
+        local cached=R.wheel_layouts[a.header]
+        if not cached or cached.signature~=signature then
+            local map,seen={},{}
+            for i=0,3 do
+                local raw=raws[i+1];local f=ffi.cast('const float *',raw)
+                local x,y,z=tonumber(f[3]),tonumber(f[4]),tonumber(f[5])
+                local axle,steered=N.u32(raw,0),N.u32(raw,4)
+                need(x==x and y==y and z==z and math.abs(x)>=0.5 and math.abs(x)<=3
+                    and math.abs(y)>=0.5 and math.abs(y)<=4 and math.abs(z)<=1,'unknown FRV wheel centre')
+                need((axle==1 and steered==0 and y>0) or (axle==2 and steered==1 and y<0),'unknown FRV axle layout')
+                local hash=y>0 and (x<0 and 'fed0a478' or 'f3cb00ad') or (x<0 and 'c6bf05a9' or 'f12186b7')
+                need(not seen[hash],'duplicate FRV wheel location');seen[hash]=true;map[i]=hash
+            end
+            local count=0;for _ in pairs(R.wheel_layouts) do count=count+1 end
+            if count>=8 then R.wheel_layouts={} end
+            cached={signature=signature,map=map};R.wheel_layouts[a.header]=cached
+            R.wheel_layout_scans=(R.wheel_layout_scans or 0)+1
+        end
+        for i=0,3 do
+            if not indices or indices[i] then
+                values[i]=get_wheel(a,i);need(values[i],'wheel parameters unavailable')
+            end
+        end
+        return {h=a.h,map=cached.map,values=values}
     end
     function R.damage_wheel(d,index,hash)
         need(R.wheels and R.wheels.damage,'wheel damage transformation guard unavailable')
@@ -719,7 +784,16 @@ return function(N, log)
         end
         return false, missing and 'missing intact sample for damaged wheel' or 'no selected blown tyre'
     end
-    function R.reset() R.cache, R.maps, R.observations, R.gait_pending = {}, {}, {}, {}; functions = {} end
+    function R.prune(vehicles)
+        local live,gait={},{}
+        for _,v in ipairs(vehicles) do
+            local d=v.d;live[d.entity..':'..d.goid..':'..d.unit..':'..d.resource]=true
+            gait[d.entity..':'..d.unit..':'..d.goid..':'..d.resource]=true
+        end
+        for k in pairs(R.observations) do if not live[k] then R.observations[k]=nil end end
+        for k in pairs(R.gait_pending) do if not gait[k] then R.gait_pending[k]=nil end end
+    end
+    function R.reset() R.cache, R.maps, R.observations, R.gait_pending, R.effect_cache, R.wheel_layouts = {}, {}, {}, {}, {}, {}; functions = {} end
     R.signatures = signatures
     if rawget(_G, "__SVR_TEST") then R.resolve_animation = resolve_animation end -- read-only metadata used by offline guard tests
     return R

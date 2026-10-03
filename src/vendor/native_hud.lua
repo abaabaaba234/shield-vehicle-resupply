@@ -57,24 +57,49 @@ return (function()
   if old then return old end
   local b=self:read(p,n);self.seen[key]=b;self.watches[#self.watches+1]={p,n,b};return b
  end
+ function G:read_fields(p,n,fields)
+  local raw=self:read(p,n)
+  for _,field in ipairs(fields) do
+   local at,size=p+field[1],field[2]
+   if field[1]<0 or size<1 or field[1]+size>n then error('watched field bounds',0) end
+   local key=string.format('%.0f:%d',at,size)
+   local b=raw:sub(field[1]+1,field[1]+size)
+   local old=self.seen[key]
+   if old and old~=b then error('identity changed during sample',0) end
+   if not old then self.seen[key]=b;self.watches[#self.watches+1]={at,size,b} end
+  end
+  return raw
+ end
  function G:validate()
   -- Adjacent/overlapping watched ranges share one fresh read. Compare only the
   -- original bytes; never validate against cached first-pass data or padding.
-  local ordered={};for i,w in ipairs(self.watches) do ordered[i]=w end
-  table.sort(ordered,function(a,b)return a[1]<b[1]end)
-  local i=1
-  while i<=#ordered do
-   local first=ordered[i][1];local finish=first+ordered[i][2];local j=i+1
-   while j<=#ordered and ordered[j][1]<=finish and math.max(finish,ordered[j][1]+ordered[j][2])-first<=4096 do
-    finish=math.max(finish,ordered[j][1]+ordered[j][2]);j=j+1
+  local plan=self.validation
+  if not plan or plan.count~=#self.watches then
+   local ordered={};for i,w in ipairs(self.watches) do ordered[i]=w end
+   table.sort(ordered,function(a,b)return a[1]<b[1]end)
+   plan={ordered=ordered,ranges={},count=#ordered}
+   local i=1
+   while i<=#ordered do
+    local first=ordered[i][1];local finish=first+ordered[i][2];local j=i+1
+    while j<=#ordered and ordered[j][1]<=finish and math.max(finish,ordered[j][1]+ordered[j][2])-first<=4096 do
+     finish=math.max(finish,ordered[j][1]+ordered[j][2]);j=j+1
+    end
+    plan.ranges[#plan.ranges+1]={first,finish-first,i,j-1};i=j
    end
-   local fresh=self:read(first,finish-first)
-   for k=i,j-1 do
-    local w=ordered[k];local offset=w[1]-first
+   self.validation=plan
+  end
+  for _,range in ipairs(plan.ranges) do
+   local fresh=self:read(range[1],range[2])
+   for k=range[3],range[4] do
+    local w=plan.ordered[k];local offset=w[1]-range[1]
     if fresh:sub(offset+1,offset+w[2])~=w[3] then error('identity changed during sample',0) end
    end
-   i=j
   end
+ end
+ -- Reuse the identity layout only; every patrol gets fresh Health and proof bytes.
+ function G:poll(p,n)
+  self.calls,self.bytes=0,0
+  local data=self:read(p,n);self:validate();return data
  end
  function G:root(name)
   local p=ptr(self:watch(self.base+N.roots[name],8),0)
@@ -84,19 +109,40 @@ return (function()
  function G:table(p)
   local b=self:watch(p,20);local cap=u32(b,8)
   if cap>1048576 or (cap>0 and 2^math.floor(math.log(cap)/math.log(2)+0.5)~=cap) then error('invalid table capacity',0) end
-  local t={p=p,entries=ptr(b,0),capacity=cap,empty=u32(b,12),multiplier=u32(b,16)}
+  local t={p=p,entries=ptr(b,0),capacity=cap,empty=u32(b,12),multiplier=u32(b,16),signature=b}
   if cap>0 then addr(t.entries,1) end;return t
  end
  function G:lookup(t,key)
   if type(key)~='number' or key<0 or key>4294967295 or key~=math.floor(key) then error('invalid identity key',0) end
   if key==t.empty or t.capacity==0 then return nil end
+  local tables=N.lookup_cache
+  if not tables then tables={};N.lookup_cache=tables;N.lookup_tables=0 end
+  local cached=tables[t.p]
+  if not cached then
+   if N.lookup_tables>=16 then tables={};N.lookup_cache=tables;N.lookup_tables=0 end
+   cached={signature=t.signature,slots={}};tables[t.p]=cached;N.lookup_tables=N.lookup_tables+1
+  elseif cached.signature~=t.signature then cached.signature=t.signature;cached.slots={} end
+  local bucket=key%256;local hit=cached.slots[bucket]
+  -- Cache locations, never contents: dense indices and owners may move.
+  if hit and hit.key==key then
+   local b=self:watch(t.entries+hit.slot*8,8)
+   if u32(b,0)==key then
+    local j=u32(b,4)
+    if j==4294967295 then return nil end
+    if j>=1048576 then error('invalid dense index',0) end
+    return j
+   end
+   cached.slots[bucket]=nil
+  end
   local first=mul32(key,t.multiplier)%t.capacity
   for step=0,math.min(t.capacity,64)-1 do
-   local b=self:watch(t.entries+((first+step)%t.capacity)*8,8)
+   local slot=(first+step)%t.capacity
+   local b=self:watch(t.entries+slot*8,8)
    local k,j=u32(b,0),u32(b,4)
    if k==key then
     if j==4294967295 then return nil end
     if j>=1048576 then error('invalid dense index',0) end
+    cached.slots[bucket]={key=key,slot=slot}
     return j
    end
    if k==t.empty then return nil end
@@ -392,6 +438,8 @@ return (function()
   end
   local base=N.win.base()
   if not base then N.ready=false;N.next_check=now+1;N.reason='game.dll not yet loaded';return false,N.reason end
+  if N.ready and N.base==base then return true,N.reason end
+  N.lookup_cache=nil;N.lookup_tables=0
   N.win.begin_sample()
   local ok,valid,why=pcall(N.check_module,N.win.read,base)
   if not ok or not valid then

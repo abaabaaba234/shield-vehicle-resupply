@@ -184,7 +184,7 @@ lua.execute(b'''
 ''')
 lua.execute(b'SVR.C.exo_weapon_guard=false');run(lua,1)
 assert lua.eval(b'next(SVR.F.configs)') is not None
-lua.execute(b'fail_address=nil');run(lua,1)
+lua.execute(b'fail_address=nil');run(lua,6)
 assert mem.r(cfg,0x5650)==original and lua.eval(b'next(SVR.F.configs)') is None
 print('PASS: failed protection restoration remains tracked and retries with guard disabled')
 

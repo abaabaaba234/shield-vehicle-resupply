@@ -209,11 +209,11 @@ menu[b'set_pending'](PREFIX+b'enabled',False);menu[b'apply_pending']()
 assert mem.r(cfg,0x5650)==original and ns['physical'](lua,2)==samples[2]
 print('PASS: menu disable restores tyre protection and native physical parameters')
 
-with zipfile.ZipFile(ROOT/'dist/ShieldVehicleResupply_v0.25-menu.zip') as archive:
+with zipfile.ZipFile(ROOT/'dist/ShieldVehicleResupply_v0.25-menu-perf3.zip') as archive:
     patch=archive.read('data/9ba626afa44a3aa3.patch_0')
     row=struct.unpack_from('<7Q6I',patch,104)
     size,encoding=struct.unpack_from('<II',patch,row[2])
     assert encoding==2 and patch[row[2]+8:row[2]+8+size]==SOURCE
     assert SOURCE.startswith(b'-- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply\n')
     assert b'ModBindings.new' not in SOURCE
-print('PASS: archive payload equals assembled v0.25-menu source and preserves addon declaration')
+print('PASS: archive payload equals assembled v0.25-menu-perf3 source and preserves addon declaration')

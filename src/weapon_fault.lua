@@ -26,11 +26,12 @@ return function(N, W, R, C, log, ammo_components)
     }
     local function key(d) return d.entity..':'..d.goid..':'..d.unit..':'..d.resource end
     local function need(v, s) if not v then error(s, 0) end end
+    local zone_fields={{0,4},{0x88,4}}
     local function report(d, why)
         local k = key(d)..':'..why
         if not F.reports[k] then F.reports[k]=true; log('weapon guard skip %s ent=%d: %s', d.resource, d.entity, why) end
     end
-    local function snapshot(d, allow_dead)
+    local function snapshot(d, allow_dead, defer_validation)
         local g = N.sample_graph()
         local net, hm = g:root('network'), g:root('health')
         g:roundtrip(net, d)
@@ -46,15 +47,16 @@ return function(N, W, R, C, log, ammo_components)
         local model = F.models[d.resource]
         need(model ~= nil, 'unsupported weapon resource')
         need(N.i32(g:watch(cfg+0x40+0xE8,4),0)==-1, 'default zone maximum changed')
-        local parts, bases = {}, {cfg+0x40}
+        local parts, layouts = {}, {g:read(cfg+0x40+0xEC,16)}
         for i, expected in ipairs(model.zones or {{hash=model.zone,max=mx}}) do
             local z=cfg+0x208+(i-1)*0x228
-            need(string.format('%08x',N.u32(g:watch(z+0x60,4),0))==expected.hash,
+            local block=g:read_fields(z+0x60,0xA0,zone_fields)
+            need(string.format('%08x',N.u32(block,0))==expected.hash,
                 'weapon damage zone identity changed')
-            local rawmax=N.i32(g:watch(z+0xE8,4),0)
+            local rawmax=N.i32(block,0x88)
             local zm=rawmax==-1 and mx or rawmax
             need(zm==(expected.max==-1 and mx or expected.max), 'weapon zone maximum changed')
-            local contribution=g:read(z+0xF8,4)
+            local contribution=block:sub(0x99,0x9C)
             if model.shield and i==1 then
                 need(contribution=='\0\0\128\63' or contribution=='\0\0\0\0', 'unexpected shield-arm damage contribution')
             else need(contribution=='\0\0\0\0', 'unexpected weapon-to-main damage contribution') end
@@ -62,15 +64,15 @@ return function(N, W, R, C, log, ammo_components)
             if i==1 then hp=math.min(hp,N.i32(data,0x14)) end
             need(hp>-1000000 and hp<=zm, 'invalid effective weapon HP')
             parts[#parts+1]={hash=expected.hash,mx=zm,hp=hp,index=i-1,rawmax=rawmax}
-            bases[#bases+1]=z
+            layouts[#layouts+1]=block:sub(0x8D,0x9C)
         end
         need(N.u32(g:watch(cfg+0x208+#parts*0x228+0x60,4),0)==0, 'unexpected additional weapon damage zone')
-        for _, base in ipairs(bases) do
-            for o=0xF0,0xF4 do need(g:read(base+o,1):byte(1)<=1, 'invalid death flags') end
-            need(N.i32(g:read(base+0xEC,4),0)==0 and g:read(base+0xF1,3)=='\0\0\0', 'unexpected constitution/death propagation')
+        for _, layout in ipairs(layouts) do
+            for i=5,9 do need(layout:byte(i)<=1, 'invalid death flags') end
+            need(N.i32(layout,0)==0 and layout:sub(6,8)=='\0\0\0', 'unexpected constitution/death propagation')
         end
-        local contribution=g:read(cfg+0x40+0xF8,4)
-        local f=ffi.new('float[1]'); ffi.copy(f,contribution,4)
+        local contribution=layouts[1]:sub(13,16)
+        local f=ffi.cast('const float *',contribution)
         need(f[0]==f[0] and f[0]>=0 and f[0]<=1, 'invalid default-to-main damage contribution')
         local bash
         if model.shield then
@@ -93,9 +95,10 @@ return function(N, W, R, C, log, ammo_components)
                 if n ~= nil then
                     need(N.same(owner,d) and owner.flags%2==1, 'ammunition owner changed')
                     local arr = N.ptr(g:watch(m+comp.arr,8),0)+n*comp.stride
+                    local data=g:read(arr,comp.stride)
                     for _, field in ipairs(comp.fields) do
                         local p = arr+field[2]
-                        local value = N.i32(g:read(p,4),0)
+                        local value = N.i32(data,field[2])
                         need(value>=0 and value<=100000, 'invalid ammunition value')
                         slots[#slots+1]={id=comp.name..':'..field[1],p=p,value=value}
                     end
@@ -103,7 +106,7 @@ return function(N, W, R, C, log, ammo_components)
             end
         end
         need(model.shield or #slots > 0, 'no verified ammunition stores; protection not armed')
-        g:validate()
+        if not defer_validation then g:validate() end
         return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=parts[1].hp,main_hp=N.i32(data,0x14),parts=parts,
             slots=slots,bash=bash,life=N.u32(data,0x19C),zone=model.zone,model=model}
     end
@@ -214,15 +217,15 @@ return function(N, W, R, C, log, ammo_components)
     function F.blocked(d) local st=F.states[key(d)]; return st~=nil and st.broken==true end
     local function service(v)
         local d=v.d
-        local s=snapshot(d)
-        local parent,why,chain=R.arm_parent(d,s.g); need(parent~=nil,why)
+        local s=snapshot(d,false,true)
+        local parent,why,chain=R.arm_parent(d,s.g,true); need(parent~=nil,why)
         need(not s.model.shield or parent.resource=='35dbf54f016f3624', 'shield parent is not EXO-55')
         s.parent,s.chain=parent,chain
         local k=key(d)
         local st=F.states[k] or {d=d}; F.states[k]=st
         need(not st.bash_owned or N.same(parent,st.parent), 'shield parent changed while input bit held')
         st.seen=true; st.hp,st.mx=s.hp,s.mx; st.parent=parent; st.parts=st.parts or {}
-        local protected=arm_config(s)
+        local protected=arm_config(s);s.protected=protected
         if not protected then report(d,'protection write incomplete; retrying') end
         st.own_broken=false
         for i,part in ipairs(s.parts) do
@@ -304,8 +307,37 @@ return function(N, W, R, C, log, ammo_components)
             st.broken=false
         else report(s.d,'shield bash restore write failed; retrying') end
     end
-    function F.step(vehicles)
-        if not N.weapon_ready or not R.health or not R.attach then F.close(); return end
+    local function prepare_poll(s,st,now)
+        st.poll=nil
+        if not now or not s.protected or st.broken or st.own_broken or st.ammo or st.bash_owned then return end
+        local e=F.configs[s.cfg]
+        for off,value in pairs(e.wrote) do
+            need(s.g:watch(s.cfg+off,#value)==value,'protection changed before patrol')
+        end
+        st.poll={g=s.g,rec=s.rec,cfg=s.cfg,mx=s.mx,parts=s.parts,next_full=now+1}
+    end
+    local function patrol(v,now)
+        local st=F.states[key(v.d)];local p=st and st.poll
+        if not now or not p or now>=p.next_full or p.g.base~=N.base
+            or st.broken or st.own_broken or st.ammo or st.bash_owned then return false end
+        local e=F.configs[p.cfg];if not e then return false end
+        local data=p.g:poll(p.rec,0x1B8)
+        need(N.u32(data,0x19C)==0,'weapon became engine-dead')
+        local health={}
+        for i,part in ipairs(p.parts) do
+            local hp=N.i32(data,0xF8+part.index*4)
+            if i==1 then hp=math.min(hp,N.i32(data,0x14)) end
+            if hp<=1 or hp>part.mx then return false end
+            health[i]=hp
+        end
+        for i,hp in ipairs(health) do st.parts[i].hp=hp end
+        st.hp=health[1];st.seen=true;e.users=e.users+1
+        F.patrols=(F.patrols or 0)+1
+        return true
+    end
+    function F.step(vehicles,now)
+        if not N.weapon_ready or not R.health or not R.attach then F.close(now); return end
+        F.close_clean=false;F.next_close=nil
         N.win.begin_sample()
         for _, e in pairs(F.configs) do e.users=0 end
         for _, st in pairs(F.states) do st.seen=false end
@@ -313,10 +345,13 @@ return function(N, W, R, C, log, ammo_components)
         for _, v in ipairs(vehicles) do
             local model=F.models[v.d.resource]
             if model and ((model.shield and C.exo_shield_guard) or (not model.shield and C.exo_weapon_guard)) then
-                local ok,s,st=pcall(service,v)
-                if not ok then report(v.d,tostring(s))
-                else
-                    samples[#samples+1]={s=s,st=st}
+                local polled,quiet=pcall(patrol,v,now)
+                if not polled or not quiet then
+                    local st=F.states[key(v.d)];if st then st.poll=nil end
+                    F.full_samples=(F.full_samples or 0)+1
+                    local ok,s,state=pcall(service,v)
+                    if not ok then report(v.d,tostring(s))
+                    else samples[#samples+1]={s=s,st=state} end
                 end
             end
         end
@@ -326,12 +361,17 @@ return function(N, W, R, C, log, ammo_components)
             if s.model.shield then ok,err=pcall(shield_input,s,st)
             else ok,err=pcall(ammunition,s,st,st.own_broken,'own damage zone') end
             if not ok then report(s.d,tostring(err)) end
+            if ok then
+                local prepared,why=pcall(prepare_poll,s,st,now)
+                if not prepared then st.poll=nil;report(s.d,tostring(why)) end
+            end
         end
         for cfg,e in pairs(F.configs) do
             if e.users==0 and close_config(e) then F.configs[cfg]=nil end
         end
         for k,st in pairs(F.states) do
             if not st.seen then
+                st.poll=nil
                 local ok,s=pcall(snapshot,st.d,true)
                 if ok then
                     local restored,done=pcall(function() return release_ammo(st,s) and restore_bash(st,s) end)
@@ -352,8 +392,23 @@ return function(N, W, R, C, log, ammo_components)
             end
         end
     end
-    function F.close()
+    function F.prune(vehicles)
+        local live={}
+        for _,v in ipairs(vehicles) do live[key(v.d)]=true end
+        for k,st in pairs(F.states) do
+            if not live[k] and not st.ammo and not st.bash_owned then F.states[k]=nil
+            else live[k]=true end
+        end
+        for k in pairs(F.reports) do
+            local owner=k:match('^(%d+:%d+:%d+:%x+):')
+            if not live[owner] then F.reports[k]=nil end
+        end
+    end
+    function F.close(now)
+        if now and (F.close_clean or (F.next_close and now<F.next_close)) then return end
+        for _,st in pairs(F.states) do st.poll=nil end
         if not N.ready then return end
+        F.next_close=now and now+0.5 or nil
         if N.weapon_ready then
             for _, st in pairs(F.states) do
                 if st.ammo or st.bash_owned then
@@ -363,12 +418,16 @@ return function(N, W, R, C, log, ammo_components)
             end
         end
         for cfg,e in pairs(F.configs) do if close_config(e) then F.configs[cfg]=nil end end
+        local pending=next(F.configs)~=nil
+        for _,st in pairs(F.states) do if st.ammo or st.bash_owned then pending=true end end
+        F.close_clean=not pending
     end
     function F.reset()
         F.close()
         local pending={}
         for k,st in pairs(F.states) do if st.bash_owned then pending[k]=st end end
         F.states,F.reports=pending,{}
+        F.next_close=nil;F.close_clean=false
         -- Failed config restores remain tracked for retry; never silently abandon them.
     end
     function F.status()

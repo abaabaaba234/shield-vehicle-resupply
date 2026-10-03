@@ -4,11 +4,12 @@ return function(N,W,R,C,log)
     local hashes={'fed0a478','f3cb00ad','c6bf05a9','f12186b7'}
     local function key(d)return d.entity..':'..d.goid..':'..d.unit..':'..d.resource end
     local function need(v,s)if not v then error(s,0)end end
+    local zone_fields={{0,4},{0x88,4}}
     local function report(d,why)
         local k=key(d)..':'..why
         if not T.reports[k] then T.reports[k]=true;log('tyre guard skip ent=%d: %s',d.entity,why)end
     end
-    local function snapshot(d)
+    local function snapshot(d,st,now)
         need(d.resource=='9b2140378640432e' or d.resource=='cc21c7ffd3ebefb9','unknown FRV resource')
         need(R.wheels and R.wheels.damage,'wheel damage transformation guard unavailable')
         local g=N.sample_graph();local net,hm=g:root('network'),g:root('health')
@@ -24,16 +25,26 @@ return function(N,W,R,C,log)
         local hp={}
         for i,hash in ipairs(hashes) do
             local z=cfg+0x208+(i-1)*0x228
-            need(string.format('%08x',N.u32(g:watch(z+0x60,4),0))==hash
-                and N.i32(g:watch(z+0xE8,4),0)==350,'unexpected FRV wheel zone')
-            need(g:read(z+0xF8,4)=='\0\0\0\0' and N.i32(g:read(z+0xEC,4),0)==0,'unexpected wheel damage contribution')
-            need(g:read(z+0xF0,1):byte(1)<=1 and g:read(z+0xF4,1)=='\0','unexpected wheel death flags')
+            local block=g:read_fields(z+0x60,0xA0,zone_fields)
+            need(string.format('%08x',N.u32(block,0))==hash
+                and N.i32(block,0x88)==350,'unexpected FRV wheel zone')
+            need(block:sub(0x99,0x9C)=='\0\0\0\0' and N.i32(block,0x8C)==0,'unexpected wheel damage contribution')
+            need(block:byte(0x91)<=1 and block:byte(0x95)==0,'unexpected wheel death flags')
             hp[i]=N.i32(data,0xF8+(i-1)*4)
             need(hp[i]>-1000000 and hp[i]<=350,'invalid wheel HP')
         end
-        local physics=R.tyre_snapshot(d);g:validate()
+        local indices
+        if now and st and now<(st.next_physics or 0) then
+            indices={}
+            for i in ipairs(hashes) do
+                local part=st.parts[i]
+                if not part or part.api==nil then indices=nil;break end
+                if part.broken or part.wrote or not part.intact or hp[i]<=1 then indices[part.api]=true end
+            end
+        end
+        local physics=R.tyre_snapshot(d,indices)
         R.maps[d.resource]=physics.map
-        return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=hp,physics=physics}
+        return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=hp,physics=physics,full_physics=indices==nil}
     end
     local function identity(e)
         local b=N.win.read(e.cfg,4);if not b then return nil end
@@ -82,9 +93,11 @@ return function(N,W,R,C,log)
         if ok and done then part.wrote=nil;return true end
         report(st.d,'wheel restore pending: '..tostring(done));return false
     end
-    local function service(v)
-        local s=snapshot(v.d);local k=key(v.d)
-        local st=T.states[k] or {d=v.d,parts={}};T.states[k]=st;st.seen=true
+    local function service(v,now)
+        local k=key(v.d);local st=T.states[k]
+        local s=snapshot(v.d,st,now)
+        st=st or {d=v.d,parts={}};T.states[k]=st;st.seen=true
+        if now and s.full_physics then st.next_physics=now+1 end
         local protected=arm_config(s)
         if not protected then report(v.d,'wheel protection write incomplete; retrying');return end
         for i,hash in ipairs(hashes) do
@@ -95,7 +108,8 @@ return function(N,W,R,C,log)
             if part.api~=nil then need(part.api==api and part.handle==s.physics.h,'wheel identity changed') end
             part.api,part.handle=api,s.physics.h
             local cur=s.physics.values[api]
-            if not part.intact and cur:byte(0x29)==0 and s.hp[i]>1 then part.intact=cur end
+            need(cur or (part.intact and not part.broken and not part.wrote and s.hp[i]>1),'required wheel parameters unavailable')
+            if not part.intact and cur and cur:byte(0x29)==0 and s.hp[i]>1 then part.intact=cur end
             if s.hp[i]<=1 and not part.broken then
                 part.broken=true;log('tyre failed ent=%d zone=%s api=%d hp=%d/350',v.d.entity,hash,api,s.hp[i])
             end
@@ -108,7 +122,7 @@ return function(N,W,R,C,log)
                 s.g:validate()
                 if not W.i32(s.rec+0xF8+(i-1)*4,s.hp[i],1) then report(v.d,'wheel HP floor write failed; retrying') end
             end
-            if part.broken and cur:byte(0x29)==0 then
+            if part.broken and cur and cur:byte(0x29)==0 then
                 need(part.intact,'no intact wheel parameters; spawn an intact FRV')
                 s.g:validate()
                 local raw,h=R.damage_wheel(v.d,api,hash)
@@ -116,6 +130,33 @@ return function(N,W,R,C,log)
                 log('tyre puncture applied ent=%d zone=%s api=%d: native physical damage, model retained by Immortal',v.d.entity,hash,api)
             end
         end
+        if now then
+            local calm=true
+            for _,part in pairs(st.parts) do
+                if part.broken or part.wrote or not part.intact then calm=false end
+            end
+            if calm then
+                local e=T.configs[s.cfg]
+                for p,value in pairs(e.wrote) do need(s.g:watch(p,1)==value,'wheel protection changed before patrol') end
+                st.poll={g=s.g,rec=s.rec,cfg=s.cfg,next_full=st.next_physics}
+            end
+        end
+    end
+    local function patrol(v,now)
+        local st=T.states[key(v.d)];local p=st and st.poll
+        if not now or not p or now>=p.next_full or p.g.base~=N.base then return false end
+        local e=T.configs[p.cfg];if not e then return false end
+        for _,part in pairs(st.parts) do if part.broken or part.wrote then return false end end
+        local data=p.g:poll(p.rec,0x1B8)
+        need(N.i32(data,0x14)>0 and N.u32(data,0x19C)==0,'FRV hull became dead')
+        local hp={}
+        for i in ipairs(hashes) do
+            hp[i]=N.i32(data,0xF8+(i-1)*4)
+            if hp[i]<=1 or hp[i]>350 then return false end
+        end
+        for i,value in ipairs(hp) do st.parts[i].hp=value end
+        st.seen=true;e.users=e.users+1;T.patrols=(T.patrols or 0)+1
+        return true
     end
     local function owner_gone(d)
         local ok,gone=pcall(function()
@@ -130,16 +171,26 @@ return function(N,W,R,C,log)
         for _,part in pairs(st.parts) do if part.api~=nil and (part.broken or part.wrote) then out[part.api]=false end end
         return out
     end
-    function T.step(vehicles)
+    function T.step(vehicles,now)
+        if not R.wheels or not R.wheels.damage then T.close(now);return end
+        T.close_clean=false;T.next_close=nil
         N.win.begin_sample()
         for _,e in pairs(T.configs) do e.users=0 end
         for _,st in pairs(T.states) do st.seen=false end
         for _,v in ipairs(vehicles) do
-            if v.kind=='frv' then local ok,why=pcall(service,v);if not ok then report(v.d,tostring(why)) end end
+            if v.kind=='frv' then
+                local polled,quiet=pcall(patrol,v,now)
+                if not polled or not quiet then
+                    local st=T.states[key(v.d)];if st then st.poll=nil end
+                    T.full_samples=(T.full_samples or 0)+1
+                    local ok,why=pcall(service,v,now);if not ok then report(v.d,tostring(why)) end
+                end
+            end
         end
         for cfg,e in pairs(T.configs) do if e.users==0 and restore_config(e) then T.configs[cfg]=nil end end
         for k,st in pairs(T.states) do
             if not st.seen then
+                st.poll=nil
                 if owner_gone(st.d) then T.states[k]=nil
                 else
                     local done=true;for _,part in pairs(st.parts) do if not restore_part(st,part) then done=false end end
@@ -148,17 +199,38 @@ return function(N,W,R,C,log)
             end
         end
     end
-    function T.close()
+    function T.prune(vehicles)
+        local live={}
+        for _,v in ipairs(vehicles) do live[key(v.d)]=true end
+        for k,st in pairs(T.states) do
+            local pending=false;for _,part in pairs(st.parts) do if part.wrote then pending=true end end
+            if not live[k] and not pending then T.states[k]=nil else live[k]=true end
+        end
+        for k in pairs(T.reports) do
+            local owner=k:match('^(%d+:%d+:%d+:%x+):')
+            if not live[owner] then T.reports[k]=nil end
+        end
+    end
+    function T.close(now)
+        if now and (T.close_clean or (T.next_close and now<T.next_close)) then return end
+        for _,st in pairs(T.states) do st.poll=nil end
         if not N.ready then return end
+        T.next_close=now and now+0.5 or nil
         for cfg,e in pairs(T.configs) do if restore_config(e) then T.configs[cfg]=nil end end
         for k,st in pairs(T.states) do
-            if owner_gone(st.d) then T.states[k]=nil
-            else
+            local pending=false;for _,part in pairs(st.parts) do if part.wrote then pending=true end end
+            if pending and owner_gone(st.d) then T.states[k]=nil
+            elseif pending then
                 for _,part in pairs(st.parts) do restore_part(st,part) end
             end
         end
+        local pending=next(T.configs)~=nil
+        for _,st in pairs(T.states) do
+            for _,part in pairs(st.parts) do if part.wrote then pending=true end end
+        end
+        T.close_clean=not pending
     end
-    function T.reset()T.close();T.reports={}end
+    function T.reset()T.close();T.reports={};T.next_close=nil;T.close_clean=false end
     function T.status()
         for _,st in pairs(T.states) do
             for _,part in pairs(st.parts) do log('tyre guard ent=%d zone=%s api=%s hp=%s/350 failed=%s',st.d.entity,part.hash,tostring(part.api),tostring(part.hp),tostring(part.broken==true)) end

@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/shieldresupply/shield_vehicle_resupply
--- Shield Vehicle Resupply v0.25-menu
+-- Shield Vehicle Resupply v0.25-menu-perf3
 -- Native read layer: DRIVER HUD 1.4.5 / HUD 1.11.1, Copyright (c) 2026 FireScallion, MIT License
 -- (see third_party/LICENSE-DRIVER-HUD.txt). Writes are added by this mod.
 local N=(function()
@@ -62,24 +62,49 @@ return (function()
   if old then return old end
   local b=self:read(p,n);self.seen[key]=b;self.watches[#self.watches+1]={p,n,b};return b
  end
+ function G:read_fields(p,n,fields)
+  local raw=self:read(p,n)
+  for _,field in ipairs(fields) do
+   local at,size=p+field[1],field[2]
+   if field[1]<0 or size<1 or field[1]+size>n then error('watched field bounds',0) end
+   local key=string.format('%.0f:%d',at,size)
+   local b=raw:sub(field[1]+1,field[1]+size)
+   local old=self.seen[key]
+   if old and old~=b then error('identity changed during sample',0) end
+   if not old then self.seen[key]=b;self.watches[#self.watches+1]={at,size,b} end
+  end
+  return raw
+ end
  function G:validate()
   -- Adjacent/overlapping watched ranges share one fresh read. Compare only the
   -- original bytes; never validate against cached first-pass data or padding.
-  local ordered={};for i,w in ipairs(self.watches) do ordered[i]=w end
-  table.sort(ordered,function(a,b)return a[1]<b[1]end)
-  local i=1
-  while i<=#ordered do
-   local first=ordered[i][1];local finish=first+ordered[i][2];local j=i+1
-   while j<=#ordered and ordered[j][1]<=finish and math.max(finish,ordered[j][1]+ordered[j][2])-first<=4096 do
-    finish=math.max(finish,ordered[j][1]+ordered[j][2]);j=j+1
+  local plan=self.validation
+  if not plan or plan.count~=#self.watches then
+   local ordered={};for i,w in ipairs(self.watches) do ordered[i]=w end
+   table.sort(ordered,function(a,b)return a[1]<b[1]end)
+   plan={ordered=ordered,ranges={},count=#ordered}
+   local i=1
+   while i<=#ordered do
+    local first=ordered[i][1];local finish=first+ordered[i][2];local j=i+1
+    while j<=#ordered and ordered[j][1]<=finish and math.max(finish,ordered[j][1]+ordered[j][2])-first<=4096 do
+     finish=math.max(finish,ordered[j][1]+ordered[j][2]);j=j+1
+    end
+    plan.ranges[#plan.ranges+1]={first,finish-first,i,j-1};i=j
    end
-   local fresh=self:read(first,finish-first)
-   for k=i,j-1 do
-    local w=ordered[k];local offset=w[1]-first
+   self.validation=plan
+  end
+  for _,range in ipairs(plan.ranges) do
+   local fresh=self:read(range[1],range[2])
+   for k=range[3],range[4] do
+    local w=plan.ordered[k];local offset=w[1]-range[1]
     if fresh:sub(offset+1,offset+w[2])~=w[3] then error('identity changed during sample',0) end
    end
-   i=j
   end
+ end
+ -- Reuse the identity layout only; every patrol gets fresh Health and proof bytes.
+ function G:poll(p,n)
+  self.calls,self.bytes=0,0
+  local data=self:read(p,n);self:validate();return data
  end
  function G:root(name)
   local p=ptr(self:watch(self.base+N.roots[name],8),0)
@@ -89,19 +114,40 @@ return (function()
  function G:table(p)
   local b=self:watch(p,20);local cap=u32(b,8)
   if cap>1048576 or (cap>0 and 2^math.floor(math.log(cap)/math.log(2)+0.5)~=cap) then error('invalid table capacity',0) end
-  local t={p=p,entries=ptr(b,0),capacity=cap,empty=u32(b,12),multiplier=u32(b,16)}
+  local t={p=p,entries=ptr(b,0),capacity=cap,empty=u32(b,12),multiplier=u32(b,16),signature=b}
   if cap>0 then addr(t.entries,1) end;return t
  end
  function G:lookup(t,key)
   if type(key)~='number' or key<0 or key>4294967295 or key~=math.floor(key) then error('invalid identity key',0) end
   if key==t.empty or t.capacity==0 then return nil end
+  local tables=N.lookup_cache
+  if not tables then tables={};N.lookup_cache=tables;N.lookup_tables=0 end
+  local cached=tables[t.p]
+  if not cached then
+   if N.lookup_tables>=16 then tables={};N.lookup_cache=tables;N.lookup_tables=0 end
+   cached={signature=t.signature,slots={}};tables[t.p]=cached;N.lookup_tables=N.lookup_tables+1
+  elseif cached.signature~=t.signature then cached.signature=t.signature;cached.slots={} end
+  local bucket=key%256;local hit=cached.slots[bucket]
+  -- Cache locations, never contents: dense indices and owners may move.
+  if hit and hit.key==key then
+   local b=self:watch(t.entries+hit.slot*8,8)
+   if u32(b,0)==key then
+    local j=u32(b,4)
+    if j==4294967295 then return nil end
+    if j>=1048576 then error('invalid dense index',0) end
+    return j
+   end
+   cached.slots[bucket]=nil
+  end
   local first=mul32(key,t.multiplier)%t.capacity
   for step=0,math.min(t.capacity,64)-1 do
-   local b=self:watch(t.entries+((first+step)%t.capacity)*8,8)
+   local slot=(first+step)%t.capacity
+   local b=self:watch(t.entries+slot*8,8)
    local k,j=u32(b,0),u32(b,4)
    if k==key then
     if j==4294967295 then return nil end
     if j>=1048576 then error('invalid dense index',0) end
+    cached.slots[bucket]={key=key,slot=slot}
     return j
    end
    if k==t.empty then return nil end
@@ -397,6 +443,8 @@ return (function()
   end
   local base=N.win.base()
   if not base then N.ready=false;N.next_check=now+1;N.reason='game.dll not yet loaded';return false,N.reason end
+  if N.ready and N.base==base then return true,N.reason end
+  N.lookup_cache=nil;N.lookup_tables=0
   N.win.begin_sample()
   local ok,valid,why=pcall(N.check_module,N.win.read,base)
   if not ok or not valid then
@@ -710,17 +758,29 @@ return function(N, log)
     function R.ensure(now)
         if not N.ready then return false end
         if R.base == N.base and now < R.next_check then return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil end
+        local force = R.next_check == 0
+        local handle = kernel_ok and kernel.GetModuleHandleA('helldivers2.exe') or nil
+        local exe_base = handle ~= nil and tonumber(ffi.cast('uintptr_t', handle)) or nil
+        if R.base ~= N.base or R.exe_base ~= exe_base then
+            for _, name in ipairs({'health','wheels','stats','attach','bash','effects','animations'}) do R[name]=nil end
+            R.exe=nil; functions={}
+        end
+        R.exe_base=exe_base
         R.base, R.next_check = N.base, now + 10
         N.win.begin_sample()
-        local exe_ok, exe = pcall(resolve_exe)
-        R.exe = exe_ok and exe or nil
+        if force or not R.exe then
+            local exe_ok, exe = pcall(resolve_exe)
+            R.exe = exe_ok and exe or nil
+        end
         for name, resolve in pairs({health = resolve_heal, wheels = resolve_wheel, stats = resolve_stat, attach = resolve_attach, bash = resolve_bash, effects = resolve_effects, animations = resolve_animation}) do
-            local ok, value = pcall(resolve)
-            R[name] = ok and value or nil
-            local status = ok and 'ok' or tostring(value)
-            if R[name .. '_status'] ~= status then
-                R[name .. '_status'] = status
-                log('repair native %s: %s', name, status)
+            if force or not R[name] then
+                local ok, value = pcall(resolve)
+                R[name] = ok and value or nil
+                local status = ok and 'ok' or tostring(value)
+                if R[name .. '_status'] ~= status then
+                    R[name .. '_status'] = status
+                    log('repair native %s: %s', name, status)
+                end
             end
         end
         return R.health ~= nil or R.wheels ~= nil or R.stats ~= nil
@@ -803,15 +863,24 @@ return function(N, log)
         R.invoke('heal', R.health.fn, pointer(hm), d.entity, fraction)
         return true
     end
-    function R.arm_parent(d, graph)
+    function R.arm_parent(d, graph, defer_validation)
         need(R.arm_types[d.resource], 'unsupported arm resource')
         local g = graph or owner_graph(d)
         local pd, why, chain = mounted_parent(g, d)
-        g:validate()
+        -- Guard service validates the combined arm/parent graph before its first edit.
+        if not graph or not defer_validation then g:validate() end
         return pd, why, chain
     end
     -- Shared fresh proof for speed, gait and particles; never trust a cached full snapshot.
-    local function fully_repaired(d, cfg, zones, config_address)
+    local function fully_repaired(d, cfg, zones, config_address, proof)
+        if proof then
+            need(N.same(proof.d,d) and proof.cfg==cfg and proof.zones==zones and proof.base==N.base, 'leg proof owner changed')
+            local g=N.graph(N.win.read,N.base)
+            for key,raw in pairs(proof.g.seen) do g.seen[key]=raw end
+            for i,w in ipairs(proof.g.watches) do g.watches[i]=w end
+            g.calls,g.bytes=proof.g.calls,proof.g.bytes
+            return g
+        end
         if not exo_types[d.resource] then return nil, 'not an exosuit' end
         local g, hm, rec = owner_graph(d)
         need(config_address(g, g:root('network'), hm, d) == cfg, 'leg Health config owner changed')
@@ -838,10 +907,15 @@ return function(N, log)
         if count < 38 then need(N.u32(g:watch(cfg + 0x208 + count * 0x228 + 0x60, 4), 0) == 0, 'incomplete leg zone list') end
         return g
     end
+    function R.leg_proof(d,cfg,zones,config_address)
+        local g,why=fully_repaired(d,cfg,zones,config_address)
+        if not g then return nil,why end
+        return {g=g,d=d,cfg=cfg,zones=zones,base=N.base}
+    end
     -- The first float in the guarded 13-float StatModifier row is movement speed.
-    function R.fix_leg(d, cfg, zones, write_float, config_address)
+    function R.fix_leg(d, cfg, zones, write_float, config_address, proof)
         if not R.stats then return false, R.stats_status end
-        local g, why = fully_repaired(d, cfg, zones, config_address)
+        local g, why = fully_repaired(d, cfg, zones, config_address, proof)
         if not g then return false, why end
         local sm = N.ptr(g:watch(R.stats.root, 8), 0)
         local row = g:lookup(g:table(sm + R.stats.tbl), d.entity)
@@ -856,8 +930,9 @@ return function(N, log)
         return true
     end
     local leg_fire = {['a1d3345e']='2b57c939', ['4a3fa896']='a5bfa032'}
-    local function effect_access(d, cfg, zones, config_address)
-        local g, why = fully_repaired(d, cfg, zones, config_address)
+    R.effect_cache = {}
+    local function effect_access(d, cfg, zones, config_address, proof)
+        local g, why = fully_repaired(d, cfg, zones, config_address, proof)
         if not g then return nil, why end
         local fx = R.effects
         local manager = N.ptr(g:watch(fx.root, 8), 0)
@@ -869,37 +944,57 @@ return function(N, log)
         local settings = N.ptr(g:watch(net + 0xF127B8, 8), 0)
         -- Keep the native constant: 0x560 is 1376 (not 1360).
         local count = 0x560
-        local start, ecfg = N.mod64hex(d.resource, count), nil
-        for step = 0, 63 do
-            local entry = g:watch(settings + ((start + step) % count) * 16, 16)
-            local resource = N.hex64(entry, 0)
-            if resource == d.resource then
+        local cached = R.effect_cache[d.resource]
+        local start, ecfg, slot = N.mod64hex(d.resource, count), nil, nil
+        if cached and cached.settings == settings then
+            local entry = g:watch(cached.slot, 16)
+            if N.hex64(entry, 0) == d.resource then
                 local index = N.u32(entry, 8)
                 need(index < count, 'EffectReference settings index')
-                ecfg = settings + 0x5600 + index * 0xF48; break
-            elseif resource == '0000000000000000' then break end
-        end
-        need(ecfg ~= nil, 'no EffectReference configuration')
-        local particles, found = {}, {}
-        for i = 0, 31 do
-            local setting = g:watch(ecfg + 8 + i * 80, 80)
-            local name = string.format('%08x', N.u32(setting, 48))
-            if leg_fire[name] then
-                need(not found[name], 'duplicate leg fire name'); found[name] = true
-                need(N.hex64(setting, 0) == '1b9236a0c8137ed1'
-                    and string.format('%08x', N.u32(setting, 32)) == leg_fire[name]
-                    and N.u32(setting, 68) == 2, 'leg fire configuration differs')
-                particles[#particles + 1] = {name=N.u32(setting,48), at=rows + i*4}
+                ecfg, slot = settings + 0x5600 + index * 0xF48, cached.slot
             end
         end
-        if #particles ~= 2 then return nil, 'no recognized leg fire pair' end
+        if not ecfg then
+            for step = 0, 63 do
+                local at = settings + ((start + step) % count) * 16
+                local entry = g:watch(at, 16)
+                local resource = N.hex64(entry, 0)
+                if resource == d.resource then
+                    local index = N.u32(entry, 8)
+                    need(index < count, 'EffectReference settings index')
+                    ecfg, slot = settings + 0x5600 + index * 0xF48, at; break
+                elseif resource == '0000000000000000' then break end
+            end
+        end
+        need(ecfg ~= nil, 'no EffectReference configuration')
+        local raw = g:watch(ecfg + 8, 32 * 80)
+        if not cached or cached.cfg ~= ecfg or cached.raw ~= raw then
+            local specs, found = {}, {}
+            for i = 0, 31 do
+                local setting = raw:sub(i * 80 + 1, (i + 1) * 80)
+                local name = string.format('%08x', N.u32(setting, 48))
+                if leg_fire[name] then
+                    need(not found[name], 'duplicate leg fire name'); found[name] = true
+                    need(N.hex64(setting, 0) == '1b9236a0c8137ed1'
+                        and string.format('%08x', N.u32(setting, 32)) == leg_fire[name]
+                        and N.u32(setting, 68) == 2, 'leg fire configuration differs')
+                    specs[#specs + 1] = {name=N.u32(setting,48), offset=i*4}
+                end
+            end
+            if #specs ~= 2 then return nil, 'no recognized leg fire pair' end
+            cached = {settings=settings,slot=slot,cfg=ecfg,raw=raw,specs=specs}
+            R.effect_cache[d.resource] = cached
+            R.effect_scans = (R.effect_scans or 0) + 1
+        end
+        local particles = {}
+        for _, spec in ipairs(cached.specs) do particles[#particles+1]={name=spec.name,at=rows+spec.offset} end
         return {g=g, manager=manager, cfg=ecfg, particles=particles}
     end
-    function R.stop_leg_fire(d, cfg, zones, config_address)
+    function R.stop_leg_fire(d, cfg, zones, config_address, proof)
         if not R.effects then return false, R.effects_status end
         -- Stop one active leg effect per service. Reacquire ownership/health on
         -- the next service, including when movement speed is already normal.
-        local a, why = effect_access(d, cfg, zones, config_address)
+        local a, why = effect_access(d, cfg, zones, config_address, proof)
         if not a then return false, why end
         for _, particle in ipairs(a.particles) do
             if N.u32(a.g:watch(particle.at, 4), 0) ~= 0 then
@@ -924,8 +1019,8 @@ return function(N, log)
         return false, 'no active leg fire'
     end
     local FINE, LEFT_LIMP, RIGHT_LIMP = 0xBDF3A6A1, 0xB8349337, 0x50781AAB
-    local function animation_access(d, cfg, zones, config_address)
-        local g, why = fully_repaired(d, cfg, zones, config_address)
+    local function animation_access(d, cfg, zones, config_address, proof)
+        local g, why = fully_repaired(d, cfg, zones, config_address, proof)
         if not g then return nil, why end
         local a = R.animations
         local manager = N.ptr(g:watch(a.root, 8), 0)
@@ -1009,9 +1104,9 @@ return function(N, log)
         end
         return {g=g,manager=manager,controller=controller,definition=definition,damaged=damaged}
     end
-    function R.fix_gait(d, cfg, zones, config_address, now)
+    function R.fix_gait(d, cfg, zones, config_address, now, proof)
         if not R.animations then return false, R.animations_status end
-        local a, why = animation_access(d, cfg, zones, config_address)
+        local a, why = animation_access(d, cfg, zones, config_address, proof)
         if not a then return false, why end
         local key = d.entity..':'..d.unit..':'..d.goid..':'..d.resource
         if a.damaged == 0 then
@@ -1032,13 +1127,14 @@ return function(N, log)
         log('exo gait event sent %s ent=%d states=%d event=fine (native animation)', d.resource, d.entity, a.damaged)
         return true
     end
+    local query_buffer,wheel_buffer=ffi.new('uint8_t[128]'),ffi.new('uint8_t[48]')
     local function wheel_access(d)
         need(R.wheels ~= nil, R.wheels_status or 'wheel interface unavailable')
         owner(d)
         local query_table = rq(R.wheels.query)
         local query = query_table and rq(query_table)
         need(query and in_engine(query), 'wheel query function unavailable')
-        local buffer = ffi.new('uint8_t[128]')
+        local buffer=query_buffer;ffi.fill(buffer,128)
         R.invoke('query', query, d.unit, 16, buffer)
         local handle_ptr = N.ptr(ffi.string(buffer, 128), 0x20)
         need(handle_ptr >= 65536, 'vehicle handle unavailable')
@@ -1070,31 +1166,48 @@ return function(N, log)
         return {h = h, get = get, set = set,header=header}
     end
     local function get_wheel(a, index)
-        local b = ffi.new('uint8_t[48]')
+        local b=wheel_buffer;ffi.fill(b,48)
         if tonumber(R.invoke('get', a.get, a.h, index, b)) == 0 then return nil end
         local s = ffi.string(b, 48)
         return s:byte(0x29) <= 1 and s or nil
     end
     -- Runtime VRW centres identify physical wheels independently of Health order.
     -- Only the two known FRV resources and the captured axle/centre schema qualify.
-    function R.tyre_snapshot(d)
+    R.wheel_layouts={}
+    function R.tyre_snapshot(d,indices)
         need(d.resource=='9b2140378640432e' or d.resource=='cc21c7ffd3ebefb9','unsupported tyre resource')
-        local a=wheel_access(d); local map,seen,values={},{},{}
+        local a=wheel_access(d); local values,raws={},{}
+        local header=read(a.header,24);need(header,'wheel resource offsets unreadable')
         for i=0,3 do
-            local off=r32(a.header+8+i*4)
+            local off=N.u32(header,8+i*4)
             need(off and off>=24 and off<=0x10000,'wheel resource offset')
-            local raw=read(a.header+off,24);need(raw,'wheel centre unreadable')
-            local f=ffi.new('float[3]');ffi.copy(f,raw:sub(13,24),12)
-            local x,y,z=tonumber(f[0]),tonumber(f[1]),tonumber(f[2])
-            local axle,steered=N.u32(raw,0),N.u32(raw,4)
-            need(x==x and y==y and z==z and math.abs(x)>=0.5 and math.abs(x)<=3
-                and math.abs(y)>=0.5 and math.abs(y)<=4 and math.abs(z)<=1,'unknown FRV wheel centre')
-            need((axle==1 and steered==0 and y>0) or (axle==2 and steered==1 and y<0),'unknown FRV axle layout')
-            local hash=y>0 and (x<0 and 'fed0a478' or 'f3cb00ad') or (x<0 and 'c6bf05a9' or 'f12186b7')
-            need(not seen[hash],'duplicate FRV wheel location');seen[hash]=true;map[i]=hash
-            values[i]=get_wheel(a,i);need(values[i],'wheel parameters unavailable')
+            raws[i+1]=read(a.header+off,24);need(raws[i+1],'wheel centre unreadable')
         end
-        return {h=a.h,map=map,values=values}
+        local signature=header..table.concat(raws)
+        local cached=R.wheel_layouts[a.header]
+        if not cached or cached.signature~=signature then
+            local map,seen={},{}
+            for i=0,3 do
+                local raw=raws[i+1];local f=ffi.cast('const float *',raw)
+                local x,y,z=tonumber(f[3]),tonumber(f[4]),tonumber(f[5])
+                local axle,steered=N.u32(raw,0),N.u32(raw,4)
+                need(x==x and y==y and z==z and math.abs(x)>=0.5 and math.abs(x)<=3
+                    and math.abs(y)>=0.5 and math.abs(y)<=4 and math.abs(z)<=1,'unknown FRV wheel centre')
+                need((axle==1 and steered==0 and y>0) or (axle==2 and steered==1 and y<0),'unknown FRV axle layout')
+                local hash=y>0 and (x<0 and 'fed0a478' or 'f3cb00ad') or (x<0 and 'c6bf05a9' or 'f12186b7')
+                need(not seen[hash],'duplicate FRV wheel location');seen[hash]=true;map[i]=hash
+            end
+            local count=0;for _ in pairs(R.wheel_layouts) do count=count+1 end
+            if count>=8 then R.wheel_layouts={} end
+            cached={signature=signature,map=map};R.wheel_layouts[a.header]=cached
+            R.wheel_layout_scans=(R.wheel_layout_scans or 0)+1
+        end
+        for i=0,3 do
+            if not indices or indices[i] then
+                values[i]=get_wheel(a,i);need(values[i],'wheel parameters unavailable')
+            end
+        end
+        return {h=a.h,map=cached.map,values=values}
     end
     function R.damage_wheel(d,index,hash)
         need(R.wheels and R.wheels.damage,'wheel damage transformation guard unavailable')
@@ -1226,7 +1339,16 @@ return function(N, log)
         end
         return false, missing and 'missing intact sample for damaged wheel' or 'no selected blown tyre'
     end
-    function R.reset() R.cache, R.maps, R.observations, R.gait_pending = {}, {}, {}, {}; functions = {} end
+    function R.prune(vehicles)
+        local live,gait={},{}
+        for _,v in ipairs(vehicles) do
+            local d=v.d;live[d.entity..':'..d.goid..':'..d.unit..':'..d.resource]=true
+            gait[d.entity..':'..d.unit..':'..d.goid..':'..d.resource]=true
+        end
+        for k in pairs(R.observations) do if not live[k] then R.observations[k]=nil end end
+        for k in pairs(R.gait_pending) do if not gait[k] then R.gait_pending[k]=nil end end
+    end
+    function R.reset() R.cache, R.maps, R.observations, R.gait_pending, R.effect_cache, R.wheel_layouts = {}, {}, {}, {}, {}, {}; functions = {} end
     R.signatures = signatures
     if rawget(_G, "__SVR_TEST") then R.resolve_animation = resolve_animation end -- read-only metadata used by offline guard tests
     return R
@@ -1262,11 +1384,12 @@ return function(N, W, R, C, log, ammo_components)
     }
     local function key(d) return d.entity..':'..d.goid..':'..d.unit..':'..d.resource end
     local function need(v, s) if not v then error(s, 0) end end
+    local zone_fields={{0,4},{0x88,4}}
     local function report(d, why)
         local k = key(d)..':'..why
         if not F.reports[k] then F.reports[k]=true; log('weapon guard skip %s ent=%d: %s', d.resource, d.entity, why) end
     end
-    local function snapshot(d, allow_dead)
+    local function snapshot(d, allow_dead, defer_validation)
         local g = N.sample_graph()
         local net, hm = g:root('network'), g:root('health')
         g:roundtrip(net, d)
@@ -1282,15 +1405,16 @@ return function(N, W, R, C, log, ammo_components)
         local model = F.models[d.resource]
         need(model ~= nil, 'unsupported weapon resource')
         need(N.i32(g:watch(cfg+0x40+0xE8,4),0)==-1, 'default zone maximum changed')
-        local parts, bases = {}, {cfg+0x40}
+        local parts, layouts = {}, {g:read(cfg+0x40+0xEC,16)}
         for i, expected in ipairs(model.zones or {{hash=model.zone,max=mx}}) do
             local z=cfg+0x208+(i-1)*0x228
-            need(string.format('%08x',N.u32(g:watch(z+0x60,4),0))==expected.hash,
+            local block=g:read_fields(z+0x60,0xA0,zone_fields)
+            need(string.format('%08x',N.u32(block,0))==expected.hash,
                 'weapon damage zone identity changed')
-            local rawmax=N.i32(g:watch(z+0xE8,4),0)
+            local rawmax=N.i32(block,0x88)
             local zm=rawmax==-1 and mx or rawmax
             need(zm==(expected.max==-1 and mx or expected.max), 'weapon zone maximum changed')
-            local contribution=g:read(z+0xF8,4)
+            local contribution=block:sub(0x99,0x9C)
             if model.shield and i==1 then
                 need(contribution=='\0\0\128\63' or contribution=='\0\0\0\0', 'unexpected shield-arm damage contribution')
             else need(contribution=='\0\0\0\0', 'unexpected weapon-to-main damage contribution') end
@@ -1298,15 +1422,15 @@ return function(N, W, R, C, log, ammo_components)
             if i==1 then hp=math.min(hp,N.i32(data,0x14)) end
             need(hp>-1000000 and hp<=zm, 'invalid effective weapon HP')
             parts[#parts+1]={hash=expected.hash,mx=zm,hp=hp,index=i-1,rawmax=rawmax}
-            bases[#bases+1]=z
+            layouts[#layouts+1]=block:sub(0x8D,0x9C)
         end
         need(N.u32(g:watch(cfg+0x208+#parts*0x228+0x60,4),0)==0, 'unexpected additional weapon damage zone')
-        for _, base in ipairs(bases) do
-            for o=0xF0,0xF4 do need(g:read(base+o,1):byte(1)<=1, 'invalid death flags') end
-            need(N.i32(g:read(base+0xEC,4),0)==0 and g:read(base+0xF1,3)=='\0\0\0', 'unexpected constitution/death propagation')
+        for _, layout in ipairs(layouts) do
+            for i=5,9 do need(layout:byte(i)<=1, 'invalid death flags') end
+            need(N.i32(layout,0)==0 and layout:sub(6,8)=='\0\0\0', 'unexpected constitution/death propagation')
         end
-        local contribution=g:read(cfg+0x40+0xF8,4)
-        local f=ffi.new('float[1]'); ffi.copy(f,contribution,4)
+        local contribution=layouts[1]:sub(13,16)
+        local f=ffi.cast('const float *',contribution)
         need(f[0]==f[0] and f[0]>=0 and f[0]<=1, 'invalid default-to-main damage contribution')
         local bash
         if model.shield then
@@ -1329,9 +1453,10 @@ return function(N, W, R, C, log, ammo_components)
                 if n ~= nil then
                     need(N.same(owner,d) and owner.flags%2==1, 'ammunition owner changed')
                     local arr = N.ptr(g:watch(m+comp.arr,8),0)+n*comp.stride
+                    local data=g:read(arr,comp.stride)
                     for _, field in ipairs(comp.fields) do
                         local p = arr+field[2]
-                        local value = N.i32(g:read(p,4),0)
+                        local value = N.i32(data,field[2])
                         need(value>=0 and value<=100000, 'invalid ammunition value')
                         slots[#slots+1]={id=comp.name..':'..field[1],p=p,value=value}
                     end
@@ -1339,7 +1464,7 @@ return function(N, W, R, C, log, ammo_components)
             end
         end
         need(model.shield or #slots > 0, 'no verified ammunition stores; protection not armed')
-        g:validate()
+        if not defer_validation then g:validate() end
         return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=parts[1].hp,main_hp=N.i32(data,0x14),parts=parts,
             slots=slots,bash=bash,life=N.u32(data,0x19C),zone=model.zone,model=model}
     end
@@ -1450,15 +1575,15 @@ return function(N, W, R, C, log, ammo_components)
     function F.blocked(d) local st=F.states[key(d)]; return st~=nil and st.broken==true end
     local function service(v)
         local d=v.d
-        local s=snapshot(d)
-        local parent,why,chain=R.arm_parent(d,s.g); need(parent~=nil,why)
+        local s=snapshot(d,false,true)
+        local parent,why,chain=R.arm_parent(d,s.g,true); need(parent~=nil,why)
         need(not s.model.shield or parent.resource=='35dbf54f016f3624', 'shield parent is not EXO-55')
         s.parent,s.chain=parent,chain
         local k=key(d)
         local st=F.states[k] or {d=d}; F.states[k]=st
         need(not st.bash_owned or N.same(parent,st.parent), 'shield parent changed while input bit held')
         st.seen=true; st.hp,st.mx=s.hp,s.mx; st.parent=parent; st.parts=st.parts or {}
-        local protected=arm_config(s)
+        local protected=arm_config(s);s.protected=protected
         if not protected then report(d,'protection write incomplete; retrying') end
         st.own_broken=false
         for i,part in ipairs(s.parts) do
@@ -1540,8 +1665,37 @@ return function(N, W, R, C, log, ammo_components)
             st.broken=false
         else report(s.d,'shield bash restore write failed; retrying') end
     end
-    function F.step(vehicles)
-        if not N.weapon_ready or not R.health or not R.attach then F.close(); return end
+    local function prepare_poll(s,st,now)
+        st.poll=nil
+        if not now or not s.protected or st.broken or st.own_broken or st.ammo or st.bash_owned then return end
+        local e=F.configs[s.cfg]
+        for off,value in pairs(e.wrote) do
+            need(s.g:watch(s.cfg+off,#value)==value,'protection changed before patrol')
+        end
+        st.poll={g=s.g,rec=s.rec,cfg=s.cfg,mx=s.mx,parts=s.parts,next_full=now+1}
+    end
+    local function patrol(v,now)
+        local st=F.states[key(v.d)];local p=st and st.poll
+        if not now or not p or now>=p.next_full or p.g.base~=N.base
+            or st.broken or st.own_broken or st.ammo or st.bash_owned then return false end
+        local e=F.configs[p.cfg];if not e then return false end
+        local data=p.g:poll(p.rec,0x1B8)
+        need(N.u32(data,0x19C)==0,'weapon became engine-dead')
+        local health={}
+        for i,part in ipairs(p.parts) do
+            local hp=N.i32(data,0xF8+part.index*4)
+            if i==1 then hp=math.min(hp,N.i32(data,0x14)) end
+            if hp<=1 or hp>part.mx then return false end
+            health[i]=hp
+        end
+        for i,hp in ipairs(health) do st.parts[i].hp=hp end
+        st.hp=health[1];st.seen=true;e.users=e.users+1
+        F.patrols=(F.patrols or 0)+1
+        return true
+    end
+    function F.step(vehicles,now)
+        if not N.weapon_ready or not R.health or not R.attach then F.close(now); return end
+        F.close_clean=false;F.next_close=nil
         N.win.begin_sample()
         for _, e in pairs(F.configs) do e.users=0 end
         for _, st in pairs(F.states) do st.seen=false end
@@ -1549,10 +1703,13 @@ return function(N, W, R, C, log, ammo_components)
         for _, v in ipairs(vehicles) do
             local model=F.models[v.d.resource]
             if model and ((model.shield and C.exo_shield_guard) or (not model.shield and C.exo_weapon_guard)) then
-                local ok,s,st=pcall(service,v)
-                if not ok then report(v.d,tostring(s))
-                else
-                    samples[#samples+1]={s=s,st=st}
+                local polled,quiet=pcall(patrol,v,now)
+                if not polled or not quiet then
+                    local st=F.states[key(v.d)];if st then st.poll=nil end
+                    F.full_samples=(F.full_samples or 0)+1
+                    local ok,s,state=pcall(service,v)
+                    if not ok then report(v.d,tostring(s))
+                    else samples[#samples+1]={s=s,st=state} end
                 end
             end
         end
@@ -1562,12 +1719,17 @@ return function(N, W, R, C, log, ammo_components)
             if s.model.shield then ok,err=pcall(shield_input,s,st)
             else ok,err=pcall(ammunition,s,st,st.own_broken,'own damage zone') end
             if not ok then report(s.d,tostring(err)) end
+            if ok then
+                local prepared,why=pcall(prepare_poll,s,st,now)
+                if not prepared then st.poll=nil;report(s.d,tostring(why)) end
+            end
         end
         for cfg,e in pairs(F.configs) do
             if e.users==0 and close_config(e) then F.configs[cfg]=nil end
         end
         for k,st in pairs(F.states) do
             if not st.seen then
+                st.poll=nil
                 local ok,s=pcall(snapshot,st.d,true)
                 if ok then
                     local restored,done=pcall(function() return release_ammo(st,s) and restore_bash(st,s) end)
@@ -1588,8 +1750,23 @@ return function(N, W, R, C, log, ammo_components)
             end
         end
     end
-    function F.close()
+    function F.prune(vehicles)
+        local live={}
+        for _,v in ipairs(vehicles) do live[key(v.d)]=true end
+        for k,st in pairs(F.states) do
+            if not live[k] and not st.ammo and not st.bash_owned then F.states[k]=nil
+            else live[k]=true end
+        end
+        for k in pairs(F.reports) do
+            local owner=k:match('^(%d+:%d+:%d+:%x+):')
+            if not live[owner] then F.reports[k]=nil end
+        end
+    end
+    function F.close(now)
+        if now and (F.close_clean or (F.next_close and now<F.next_close)) then return end
+        for _,st in pairs(F.states) do st.poll=nil end
         if not N.ready then return end
+        F.next_close=now and now+0.5 or nil
         if N.weapon_ready then
             for _, st in pairs(F.states) do
                 if st.ammo or st.bash_owned then
@@ -1599,12 +1776,16 @@ return function(N, W, R, C, log, ammo_components)
             end
         end
         for cfg,e in pairs(F.configs) do if close_config(e) then F.configs[cfg]=nil end end
+        local pending=next(F.configs)~=nil
+        for _,st in pairs(F.states) do if st.ammo or st.bash_owned then pending=true end end
+        F.close_clean=not pending
     end
     function F.reset()
         F.close()
         local pending={}
         for k,st in pairs(F.states) do if st.bash_owned then pending[k]=st end end
         F.states,F.reports=pending,{}
+        F.next_close=nil;F.close_clean=false
         -- Failed config restores remain tracked for retry; never silently abandon them.
     end
     function F.status()
@@ -1629,11 +1810,12 @@ return function(N,W,R,C,log)
     local hashes={'fed0a478','f3cb00ad','c6bf05a9','f12186b7'}
     local function key(d)return d.entity..':'..d.goid..':'..d.unit..':'..d.resource end
     local function need(v,s)if not v then error(s,0)end end
+    local zone_fields={{0,4},{0x88,4}}
     local function report(d,why)
         local k=key(d)..':'..why
         if not T.reports[k] then T.reports[k]=true;log('tyre guard skip ent=%d: %s',d.entity,why)end
     end
-    local function snapshot(d)
+    local function snapshot(d,st,now)
         need(d.resource=='9b2140378640432e' or d.resource=='cc21c7ffd3ebefb9','unknown FRV resource')
         need(R.wheels and R.wheels.damage,'wheel damage transformation guard unavailable')
         local g=N.sample_graph();local net,hm=g:root('network'),g:root('health')
@@ -1649,16 +1831,26 @@ return function(N,W,R,C,log)
         local hp={}
         for i,hash in ipairs(hashes) do
             local z=cfg+0x208+(i-1)*0x228
-            need(string.format('%08x',N.u32(g:watch(z+0x60,4),0))==hash
-                and N.i32(g:watch(z+0xE8,4),0)==350,'unexpected FRV wheel zone')
-            need(g:read(z+0xF8,4)=='\0\0\0\0' and N.i32(g:read(z+0xEC,4),0)==0,'unexpected wheel damage contribution')
-            need(g:read(z+0xF0,1):byte(1)<=1 and g:read(z+0xF4,1)=='\0','unexpected wheel death flags')
+            local block=g:read_fields(z+0x60,0xA0,zone_fields)
+            need(string.format('%08x',N.u32(block,0))==hash
+                and N.i32(block,0x88)==350,'unexpected FRV wheel zone')
+            need(block:sub(0x99,0x9C)=='\0\0\0\0' and N.i32(block,0x8C)==0,'unexpected wheel damage contribution')
+            need(block:byte(0x91)<=1 and block:byte(0x95)==0,'unexpected wheel death flags')
             hp[i]=N.i32(data,0xF8+(i-1)*4)
             need(hp[i]>-1000000 and hp[i]<=350,'invalid wheel HP')
         end
-        local physics=R.tyre_snapshot(d);g:validate()
+        local indices
+        if now and st and now<(st.next_physics or 0) then
+            indices={}
+            for i in ipairs(hashes) do
+                local part=st.parts[i]
+                if not part or part.api==nil then indices=nil;break end
+                if part.broken or part.wrote or not part.intact or hp[i]<=1 then indices[part.api]=true end
+            end
+        end
+        local physics=R.tyre_snapshot(d,indices)
         R.maps[d.resource]=physics.map
-        return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=hp,physics=physics}
+        return {g=g,d=d,cfg=cfg,rec=rec,mx=mx,hp=hp,physics=physics,full_physics=indices==nil}
     end
     local function identity(e)
         local b=N.win.read(e.cfg,4);if not b then return nil end
@@ -1707,9 +1899,11 @@ return function(N,W,R,C,log)
         if ok and done then part.wrote=nil;return true end
         report(st.d,'wheel restore pending: '..tostring(done));return false
     end
-    local function service(v)
-        local s=snapshot(v.d);local k=key(v.d)
-        local st=T.states[k] or {d=v.d,parts={}};T.states[k]=st;st.seen=true
+    local function service(v,now)
+        local k=key(v.d);local st=T.states[k]
+        local s=snapshot(v.d,st,now)
+        st=st or {d=v.d,parts={}};T.states[k]=st;st.seen=true
+        if now and s.full_physics then st.next_physics=now+1 end
         local protected=arm_config(s)
         if not protected then report(v.d,'wheel protection write incomplete; retrying');return end
         for i,hash in ipairs(hashes) do
@@ -1720,7 +1914,8 @@ return function(N,W,R,C,log)
             if part.api~=nil then need(part.api==api and part.handle==s.physics.h,'wheel identity changed') end
             part.api,part.handle=api,s.physics.h
             local cur=s.physics.values[api]
-            if not part.intact and cur:byte(0x29)==0 and s.hp[i]>1 then part.intact=cur end
+            need(cur or (part.intact and not part.broken and not part.wrote and s.hp[i]>1),'required wheel parameters unavailable')
+            if not part.intact and cur and cur:byte(0x29)==0 and s.hp[i]>1 then part.intact=cur end
             if s.hp[i]<=1 and not part.broken then
                 part.broken=true;log('tyre failed ent=%d zone=%s api=%d hp=%d/350',v.d.entity,hash,api,s.hp[i])
             end
@@ -1733,7 +1928,7 @@ return function(N,W,R,C,log)
                 s.g:validate()
                 if not W.i32(s.rec+0xF8+(i-1)*4,s.hp[i],1) then report(v.d,'wheel HP floor write failed; retrying') end
             end
-            if part.broken and cur:byte(0x29)==0 then
+            if part.broken and cur and cur:byte(0x29)==0 then
                 need(part.intact,'no intact wheel parameters; spawn an intact FRV')
                 s.g:validate()
                 local raw,h=R.damage_wheel(v.d,api,hash)
@@ -1741,6 +1936,33 @@ return function(N,W,R,C,log)
                 log('tyre puncture applied ent=%d zone=%s api=%d: native physical damage, model retained by Immortal',v.d.entity,hash,api)
             end
         end
+        if now then
+            local calm=true
+            for _,part in pairs(st.parts) do
+                if part.broken or part.wrote or not part.intact then calm=false end
+            end
+            if calm then
+                local e=T.configs[s.cfg]
+                for p,value in pairs(e.wrote) do need(s.g:watch(p,1)==value,'wheel protection changed before patrol') end
+                st.poll={g=s.g,rec=s.rec,cfg=s.cfg,next_full=st.next_physics}
+            end
+        end
+    end
+    local function patrol(v,now)
+        local st=T.states[key(v.d)];local p=st and st.poll
+        if not now or not p or now>=p.next_full or p.g.base~=N.base then return false end
+        local e=T.configs[p.cfg];if not e then return false end
+        for _,part in pairs(st.parts) do if part.broken or part.wrote then return false end end
+        local data=p.g:poll(p.rec,0x1B8)
+        need(N.i32(data,0x14)>0 and N.u32(data,0x19C)==0,'FRV hull became dead')
+        local hp={}
+        for i in ipairs(hashes) do
+            hp[i]=N.i32(data,0xF8+(i-1)*4)
+            if hp[i]<=1 or hp[i]>350 then return false end
+        end
+        for i,value in ipairs(hp) do st.parts[i].hp=value end
+        st.seen=true;e.users=e.users+1;T.patrols=(T.patrols or 0)+1
+        return true
     end
     local function owner_gone(d)
         local ok,gone=pcall(function()
@@ -1755,16 +1977,26 @@ return function(N,W,R,C,log)
         for _,part in pairs(st.parts) do if part.api~=nil and (part.broken or part.wrote) then out[part.api]=false end end
         return out
     end
-    function T.step(vehicles)
+    function T.step(vehicles,now)
+        if not R.wheels or not R.wheels.damage then T.close(now);return end
+        T.close_clean=false;T.next_close=nil
         N.win.begin_sample()
         for _,e in pairs(T.configs) do e.users=0 end
         for _,st in pairs(T.states) do st.seen=false end
         for _,v in ipairs(vehicles) do
-            if v.kind=='frv' then local ok,why=pcall(service,v);if not ok then report(v.d,tostring(why)) end end
+            if v.kind=='frv' then
+                local polled,quiet=pcall(patrol,v,now)
+                if not polled or not quiet then
+                    local st=T.states[key(v.d)];if st then st.poll=nil end
+                    T.full_samples=(T.full_samples or 0)+1
+                    local ok,why=pcall(service,v,now);if not ok then report(v.d,tostring(why)) end
+                end
+            end
         end
         for cfg,e in pairs(T.configs) do if e.users==0 and restore_config(e) then T.configs[cfg]=nil end end
         for k,st in pairs(T.states) do
             if not st.seen then
+                st.poll=nil
                 if owner_gone(st.d) then T.states[k]=nil
                 else
                     local done=true;for _,part in pairs(st.parts) do if not restore_part(st,part) then done=false end end
@@ -1773,17 +2005,38 @@ return function(N,W,R,C,log)
             end
         end
     end
-    function T.close()
+    function T.prune(vehicles)
+        local live={}
+        for _,v in ipairs(vehicles) do live[key(v.d)]=true end
+        for k,st in pairs(T.states) do
+            local pending=false;for _,part in pairs(st.parts) do if part.wrote then pending=true end end
+            if not live[k] and not pending then T.states[k]=nil else live[k]=true end
+        end
+        for k in pairs(T.reports) do
+            local owner=k:match('^(%d+:%d+:%d+:%x+):')
+            if not live[owner] then T.reports[k]=nil end
+        end
+    end
+    function T.close(now)
+        if now and (T.close_clean or (T.next_close and now<T.next_close)) then return end
+        for _,st in pairs(T.states) do st.poll=nil end
         if not N.ready then return end
+        T.next_close=now and now+0.5 or nil
         for cfg,e in pairs(T.configs) do if restore_config(e) then T.configs[cfg]=nil end end
         for k,st in pairs(T.states) do
-            if owner_gone(st.d) then T.states[k]=nil
-            else
+            local pending=false;for _,part in pairs(st.parts) do if part.wrote then pending=true end end
+            if pending and owner_gone(st.d) then T.states[k]=nil
+            elseif pending then
                 for _,part in pairs(st.parts) do restore_part(st,part) end
             end
         end
+        local pending=next(T.configs)~=nil
+        for _,st in pairs(T.states) do
+            for _,part in pairs(st.parts) do if part.wrote then pending=true end end
+        end
+        T.close_clean=not pending
     end
-    function T.reset()T.close();T.reports={}end
+    function T.reset()T.close();T.reports={};T.next_close=nil;T.close_clean=false end
     function T.status()
         for _,st in pairs(T.states) do
             for _,part in pairs(st.parts) do log('tyre guard ent=%d zone=%s api=%s hp=%s/350 failed=%s',st.d.entity,part.hash,tostring(part.api),tostring(part.hp),tostring(part.broken==true)) end
@@ -2228,11 +2481,14 @@ do
     pcall(ffi.cdef, 'int __stdcall ReadProcessMemory(void *, const void *, void *, size_t, size_t *);')
     local ok, k = pcall(ffi.load, 'kernel32')
     local mbi, got = ffi.new('uint8_t[48]'), ffi.new('size_t[1]')
+    local old_i,new_i,new_f=ffi.new('int32_t[1]'),ffi.new('int32_t[1]'),ffi.new('float[1]')
+    local raw_buf,old_prot,back_prot=ffi.new('uint8_t[4]'),ffi.new('unsigned long[1]'),ffi.new('unsigned long[1]')
     W.writes, W.fails = 0, 0
     W.fast = ok  -- 离线测试里关掉
     -- 大块读取（v0.11）：先用 VirtualQuery 确认整段都是已提交、可读、非 guard 页（和 N.win.read 同样的规则），
     -- 再一次 ReadProcessMemory 读完。原来每 4 KB 一次 RPM + 字符串拼接
     local rbuf, rcap = nil, 0
+    function W.release_buffer() rbuf, rcap = nil, 0 end
     function W.read_big(p, n)
         if not (W.fast and ok) or type(p) ~= 'number' or p < 65536 or n < 1 or p + n > 140737488355328 then return nil end
         local at, finish = p, p + n
@@ -2263,8 +2519,7 @@ do
     end
     function W.i32(p, old, new)
         if not ok or new == old then return false end
-        local ob = ffi.new('int32_t[1]', old)
-        local nb = ffi.new('int32_t[1]', new)
+        local ob,nb=old_i,new_i;ob[0],nb[0]=old,new
         local before = N.win.read(p, 4)
         if before ~= ffi.string(ob, 4) or not W.writable(p) then W.fails = W.fails + 1; return false end
         stage('first memory write')
@@ -2281,7 +2536,7 @@ do
     -- float 字段（v0.12 影子字段）：旧值按原始 4 字节比对，所以不受浮点误差影响
     function W.f32(p, oldraw, new)
         if not ok then return false end
-        local nb = ffi.new('float[1]', new)
+        local nb=new_f;nb[0]=new
         local ns = ffi.string(nb, 4)
         if ns == oldraw then return false end
         if N.win.read(p, 4) ~= oldraw or not W.writable(p) then W.fails = W.fails + 1; return false end
@@ -2303,7 +2558,7 @@ do
     function W.raw(p, n, oldraw, newraw)
         if not ok or not (n == 1 or n == 4) then return false end
         if N.win.read(p, n) ~= oldraw then W.fails = W.fails + 1; return false end
-        local prot = ffi.new('unsigned long[1]')
+        local prot=old_prot
         local forced = false
         if not W.writable(p) then
             if not (C.native_force) then W.fails = W.fails + 1; return false end
@@ -2311,13 +2566,13 @@ do
             forced = true
             W.forced = (W.forced or 0) + 1
         end
-        local buf = ffi.new('uint8_t[?]', n)
+        local buf=raw_buf
         ffi.copy(buf, newraw, n)
         got[0] = 0
         local r = k.WriteProcessMemory(k.GetCurrentProcess(), ffi.cast('void *', p), buf, n, got)
         local good = r ~= 0 and tonumber(got[0]) == n and N.win.read(p, n) == newraw
         if forced then
-            local back = ffi.new('unsigned long[1]')
+            local back=back_prot
             ffi.C.VirtualProtect(ffi.cast('void *', p), n, prot[0], back)
         end
         if good then W.writes = W.writes + 1 else W.fails = W.fails + 1 end
@@ -2348,8 +2603,17 @@ local S = {
     shield_born = {}, shield_expired = {}, vstate = {},
     prev_counts = nil, seen_ent = nil, spotted = {},
     last_total = {}, last_hit = {}, frac = {}, ammo_max = {}, reported = {},
+    report_order = {}, report_slot = 0, index_cache = {}, config_cache = {},
 }
 REPAIR.vehicle_roster = function() return S.vehicles end
+local function report_once(key)
+    if S.reported[key] then return false end
+    S.report_slot = S.report_slot % 512 + 1
+    local old = S.report_order[S.report_slot]
+    if old then S.reported[old] = nil end
+    S.report_order[S.report_slot], S.reported[key] = key, true
+    return true
+end
 local function reset_context()
     S.vehicles, S.weapons, S.shields, S.seen_ent, S.spotted = {}, {}, {}, nil, {}
     S.last_total, S.last_hit, S.frac, S.ammo_max, S.reported, S.next_roster = {}, {}, {}, {}, {}, 0
@@ -2357,6 +2621,10 @@ local function reset_context()
     S.hptrace = nil
     S.wheel_trace, S.next_wheel_learn = nil, 0
     S.mech_trace = nil
+    S.watch, S.prev_counts = nil, nil
+    S.report_order, S.report_slot, S.index_cache, S.config_cache = {}, 0, {}, {}
+    N.lookup_cache, N.lookup_tables = nil, 0
+    W.release_buffer()
     FAULT.reset()
     TYRE.reset()
     S.next_fault=0
@@ -2460,6 +2728,12 @@ local function u32s(str) return ffi.cast('const uint32_t *', str) end
 -- 扫描 实体 -> 下标 哈希表，返回平行数组（不给每个条目建小表）
 local function scan_index(t, bound, what)
     local raw = bulk(t.entries, t.capacity * 8)
+    local cached = S.index_cache[t.p]
+    if cached and cached.signature == t.signature and cached.raw == raw and cached.bound == bound then
+        S.index_hits = (S.index_hits or 0) + 1
+        return cached.es, cached.js, cached.n, cached.maxj, raw
+    end
+    S.index_scans = (S.index_scans or 0) + 1
     local a, empty = u32s(raw), t.empty
     local es, js, n, maxj = {}, {}, 0, -1
     for i = 0, t.capacity * 2 - 2, 2 do
@@ -2470,6 +2744,9 @@ local function scan_index(t, bound, what)
             if j > maxj then maxj = j end
         end
     end
+    local count = 0; for _ in pairs(S.index_cache) do count = count + 1 end
+    if not cached and count >= 8 then S.index_cache = {} end
+    S.index_cache[t.p] = {signature=t.signature,raw=raw,bound=bound,es=es,js=js,n=n,maxj=maxj}
     return es, js, n, maxj, raw
 end
 
@@ -2549,6 +2826,22 @@ local function observe_ammo(manager, comp, weapons, first)
     end
 end
 
+local function prune_roster()
+    local live = {}
+    for _, entries in ipairs({S.vehicles, S.weapons}) do
+        for _, entry in ipairs(entries) do live[entry.d.entity .. ':' .. entry.d.goid] = true end
+    end
+    for _, entries in ipairs({S.last_total,S.last_hit,S.frac,S.ammo_max,S.wheel_trace or {},S.mech_trace or {}}) do
+        for key in pairs(entries) do
+            local owner = key:match('^(%d+:%d+)')
+            if owner and not live[owner] then entries[key] = nil end
+        end
+    end
+    REPAIR.prune(S.vehicles)
+    FAULT.prune(S.vehicles)
+    TYRE.prune(S.vehicles)
+end
+
 local function rebuild_roster()
     N.win.begin_sample()
     local hm = ptr(N.win.read(N.base + N.roots.health, 8) or ('\0'):rep(8), 0)
@@ -2582,8 +2875,7 @@ local function rebuild_roster()
                     local hp, life = i32(b, 0x14), u32(b, 0x19C)
                     if hp <= 0 or life ~= 0 then
                         local report = 'arm-health:' .. v.d.entity .. ':' .. v.d.goid .. ':' .. tostring(life)
-                        if not S.reported[report] then
-                            S.reported[report] = true
+                        if report_once(report) then
                             log('mech arm unavailable %s ent=%d goid=%d hp=%d life=%08x: %s', v.d.resource, v.d.entity, v.d.goid, hp, life,
                                 life ~= 0 and 'engine-dead; no respawn path' or 'zero HP; game repair requires a live native parent')
                         end
@@ -2815,11 +3107,22 @@ end
 local function config_address(g, net, hm, d)
     local j = g:lookup(g:table(hm + 0x1070), d.entity)
     if j ~= nil then return ptr(g:watch(hm + 0x10B0, 8), 0) + j * 0x5650 end
-    local t = ptr(g:watch(net + 0xF12B78, 8), 0); local start = N.mod64hex(d.resource, 1002)
+    local t = ptr(g:watch(net + 0xF12B78, 8), 0)
+    local cached = S.config_cache[d.resource]
+    if cached and cached.base == t then
+        local row = g:watch(cached.row, 16)
+        if hex64(row, 0) == d.resource then
+            local k = u32(row, 8); if k >= 1002 then error('Health settings index', 0) end
+            return t + 0x3EA0 + k * 0x5650
+        end
+    end
+    S.config_cache[d.resource] = nil
+    local start = N.mod64hex(d.resource, 1002)
     for step = 0, 63 do
         local row = g:watch(t + ((start + step) % 1002) * 16, 16); local key = hex64(row, 0)
         if key == d.resource then
             local k = u32(row, 8); if k >= 1002 then error('Health settings index', 0) end
+            S.config_cache[d.resource] = {base=t,row=t+((start+step)%1002)*16}
             return t + 0x3EA0 + k * 0x5650
         elseif key == '0000000000000000' then break end
     end
@@ -2859,8 +3162,9 @@ local CFG = {
 local CFG_ON = {}   -- [配置地址] = { orig/wrote = 4 字节原值/我们写的值, users = 本轮罩子里的载具数 }
 
 local function f32_at(s, o) return ffi.cast('const float *', s)[o / 4] end
-local function raw_f32(x) return ffi.string(ffi.new('float[1]', x), 4) end
-local function raw_u32(x) return ffi.string(ffi.new('uint32_t[1]', x), 4) end
+local scalar_f,scalar_u=ffi.new('float[1]'),ffi.new('uint32_t[1]')
+local function raw_f32(x) scalar_f[0]=x;return ffi.string(scalar_f,4) end
+local function raw_u32(x) scalar_u[0]=x;return ffi.string(scalar_u,4) end
 local function finite_pos(x) return type(x) == 'number' and x == x and x >= 0 and x < 1e7 end
 local function cfg_read(cfg, off)
     local b = N.win.read(cfg + off, 4)
@@ -2969,8 +3273,7 @@ local function native_zone_open(e, zc)
         elseif not cur then
             blocked = blocked + 1
             local key = 'nz' .. e.res .. z.hash .. tostring(why)
-            if not S.reported[key] then
-                S.reported[key] = true
+            if report_once(key) then
                 log('native zone skip %s zone=%s: %s', e.res, z.hash, tostring(why))
             end
         end
@@ -2996,8 +3299,7 @@ local function native_apply(v, cfg, mx, rate, zc)
         local h, why = cfg_header(cfg)
         if not h then
             local k = 'nc' .. v.d.resource
-            if not S.reported[k] then
-                S.reported[k] = true
+            if report_once(k) then
                 log('native: %s %s 的配置头不像 HealthComponent（%s），这次不改配置；发 healcfg 看原始字节', v.kind, v.d.resource, tostring(why))
             end
             return false
@@ -3060,7 +3362,7 @@ native_close = function(cfg, why)
     end
 end
 local function native_close_all(why)
-    for _, v in pairs(S.vstate) do v.repair_credit = nil end
+    for _, v in pairs(S.vstate) do v.repair_credit, v.leg_check = nil, nil end
     local list = {}
     for cfg in pairs(CFG_ON) do list[#list + 1] = cfg end
     for _, cfg in ipairs(list) do native_close(cfg, why) end
@@ -3114,7 +3416,7 @@ local function trace_wheels(v, data, zc, cfg, native_zones)
     if C.tires and REPAIR.wheels then
         local ok, why = pcall(REPAIR.observe_damage, v.d, zc.zones, data)
         local report = 'wm' .. v.d.resource .. tostring(why)
-        if not ok and not S.reported[report] then S.reported[report] = true; log('wheel mapping skip %s: %s', v.d.resource, tostring(why)) end
+        if not ok and report_once(report) then log('wheel mapping skip %s: %s', v.d.resource, tostring(why)) end
     end
     S.wheel_trace = S.wheel_trace or {}
     local key = v.d.entity .. ':' .. v.d.goid .. ':' .. v.d.resource
@@ -3149,8 +3451,7 @@ local function repair_parts(v, zones, data, rate, dt, key, cfg)
     local d, changed = v.d, 0
     local function report(prefix, reason)
         local report_key = prefix .. key .. reason
-        if not S.reported[report_key] then
-            S.reported[report_key] = true
+        if report_once(report_key) then
             log('%s %s ent=%d: %s', prefix, v.kind, d.entity, reason)
         end
     end
@@ -3204,23 +3505,31 @@ local function repair_parts(v, zones, data, rate, dt, key, cfg)
             report('part repair skip', 'a part is disabled; game repair function affects all zones')
         else v.repair_credit = nil end
     else v.repair_credit = nil end
-    if C.exo_leg_fix and v.kind == 'exo' and not damaged and all_selected then
-        local ok, done, why = pcall(REPAIR.fix_leg, d, cfg, zones, W.f32, config_address)
+    local leg = v.leg_check
+    if damaged or not all_selected or not C.exo_leg_fix then v.leg_check=nil; leg=nil end
+    if C.exo_leg_fix and v.kind == 'exo' and not damaged and all_selected
+        and (not leg or leg.cfg~=cfg or S.clock>=leg.next_t) then
+        local proof=REPAIR.leg_proof(d,cfg,zones,config_address)
+        local ok, done, why = pcall(REPAIR.fix_leg, d, cfg, zones, W.f32, config_address, proof)
         if ok and done then changed = changed + 1
         elseif not ok or (why and why ~= 'no 0.75 leg penalty' and why ~= 'no stat modifier row'
             and why ~= 'exosuit is not fully repaired') then report('exo leg repair skip', tostring(ok and why or done)) end
-        local fire_ok, stopped, reason = pcall(REPAIR.stop_leg_fire, d, cfg, zones, config_address)
+        local fire_ok, stopped, reason = pcall(REPAIR.stop_leg_fire, d, cfg, zones, config_address, proof)
         if fire_ok and stopped then changed = changed + 1
         elseif not fire_ok or (reason and reason ~= 'no active leg fire' and reason ~= 'no effect reference row'
             and reason ~= 'no recognized leg fire pair' and reason ~= 'exosuit is not fully repaired') then
             report('exo leg fire skip', tostring(fire_ok and reason or stopped))
         end
-        local gait_ok, sent, gait_reason = pcall(REPAIR.fix_gait, d, cfg, zones, config_address, S.clock)
+        local gait_ok, sent, gait_reason = pcall(REPAIR.fix_gait, d, cfg, zones, config_address, S.clock, proof)
         if gait_ok and sent then changed = changed + 1
         elseif not gait_ok or (gait_reason and gait_reason ~= 'no limp animation state'
             and gait_reason ~= 'gait event pending' and gait_reason ~= 'exosuit is not fully repaired') then
             report('exo gait skip', tostring(gait_ok and gait_reason or sent))
         end
+        local calm=ok and (done or why=='no 0.75 leg penalty' or why=='no stat modifier row')
+            and fire_ok and not stopped and (reason=='no active leg fire' or reason=='no effect reference row' or reason=='no recognized leg fire pair')
+            and gait_ok and not sent and gait_reason=='no limp animation state'
+        v.leg_check={cfg=cfg,next_t=S.clock+(calm and 2 or C.tick)}
     end
     if C.tires and v.kind == 'frv' and S.clock >= (v.next_wheel or 0) then
         v.next_wheel = S.clock + math.max(0.5, C.wheel_interval)
@@ -3346,8 +3655,7 @@ local function heal(v, dt)
                 local n = amount(zk, z.max, rate, dt)
                 if n > 0 and W.i32(rec + zo, z.hp, math.min(z.max, z.hp + n)) then
                     changed = changed + 1
-                    if not S.reported['hz' .. key .. z.i] then
-                        S.reported['hz' .. key .. z.i] = true
+                    if report_once('hz' .. key .. z.i) then
                         log('hull zone %s entity=%d zone=%s from %d (state kept)', v.kind, d.entity, z.hash, z.hp)
                     end
                 end
@@ -3850,7 +4158,7 @@ local function tick(dt)
         -- 先读网络表：rebuild_roster 里的 owner 描述符直接从这份缓存取
         local ok2, list = pcall(net_descriptors, C.spot)
         local ok, err = pcall(rebuild_roster)
-        if not ok then log('roster: %s', tostring(err)) end
+        if ok then prune_roster() else log('roster: %s', tostring(err)) end
         NETDESC.raw = nil
         if ok2 then
             -- 护盾生成器实体在罩子消失后还会留在地上，所以按 wiki 持续时间（40 秒）计时：
@@ -3888,7 +4196,7 @@ local function tick(dt)
                 if not ok or (not done and why) then
                     local reason = tostring(ok and why or done)
                     local report = 'wl' .. v.d.resource .. reason
-                    if not S.reported[report] then S.reported[report] = true; log('wheel learn skip %s: %s', v.d.resource, reason) end
+                    if report_once(report) then log('wheel learn skip %s: %s', v.d.resource, reason) end
                 end
             end
         end
@@ -3917,16 +4225,16 @@ local function tick(dt)
             w.i = w.i + 1; if w.i > #w.marks then S.watch = nil end
         end
     end
-    if not C.enabled then native_close_all('mod off'); FAULT.close(); TYRE.close(); return end
+    if not C.enabled then native_close_all('mod off'); FAULT.close(S.clock); TYRE.close(S.clock); return end
     -- Prevention and failure latch also run outside the shield. Always sample
     -- before a repair pass, so healing cannot conceal a just-reached 1 HP state.
     if C.exo_weapon_guard or C.exo_shield_guard or C.frv_tire_guard then
         if S.clock >= (S.next_fault or 0) or S.acc+dt >= C.tick then
             S.next_fault=S.clock+0.05
-            if C.exo_weapon_guard or C.exo_shield_guard then FAULT.step(S.vehicles) else FAULT.close() end
-            if C.frv_tire_guard then TYRE.step(S.vehicles) else TYRE.close() end
+            if C.exo_weapon_guard or C.exo_shield_guard then FAULT.step(S.vehicles,S.clock) else FAULT.close(S.clock) end
+            if C.frv_tire_guard then TYRE.step(S.vehicles,S.clock) else TYRE.close(S.clock) end
         end
-    else FAULT.close(); TYRE.close() end
+    else FAULT.close(S.clock); TYRE.close(S.clock) end
     S.acc = S.acc + dt
     if S.acc < C.tick then return end
     local step = math.min(S.acc, 1); S.acc = 0
@@ -3957,16 +4265,16 @@ local function tick(dt)
                 local okh, rh = pcall(net_heal, v, step)
                 if not okh or type(rh) == 'string' then
                     local k = 'n' .. v.d.entity .. tostring(rh)
-                    if not S.reported[k] then S.reported[k] = true; log('net heal %s %d: %s', v.kind, v.d.entity, tostring(rh)) end
+                    if report_once(k) then log('net heal %s %d: %s', v.kind, v.d.entity, tostring(rh)) end
                 end
             end
             local ok, r = pcall(heal, v, step)
             if not ok then
                 v.repair_credit = nil
                 local k = v.d.entity .. tostring(r)
-                if not S.reported[k] then S.reported[k] = true; log('heal %s %d: %s', v.kind, v.d.entity, tostring(r)) end
+                if report_once(k) then log('heal %s %d: %s', v.kind, v.d.entity, tostring(r)) end
             end
-        else v.repair_credit = nil end
+        else v.repair_credit, v.leg_check = nil, nil end
     end
     native_idle('没有载具在罩子里')
     if C.ammo and N.weapon_ready then
@@ -3978,7 +4286,7 @@ local function tick(dt)
                 local ok, r = pcall(refill, w, step, false)
                 if not ok then
                     local k = 'w' .. w.d.entity .. tostring(r)
-                    if not S.reported[k] then S.reported[k] = true; log('ammo %s %d: %s', w.comp.name, w.d.entity, tostring(r)) end
+                    if report_once(k) then log('ammo %s %d: %s', w.comp.name, w.d.entity, tostring(r)) end
                 end
             end
         end
@@ -4005,6 +4313,7 @@ rawset(_G, 'update', function(dt, ...)
         menu_clock=menu_clock+dt
         MENU.step(menu_clock) -- Also available on the ship, with native guards closed, or while disabled.
         local ok, err = pcall(tick, dt)
+        REF.map, REF.frame, NETDESC.raw, S.want_units = nil, -1, nil, nil
         if not ok then
             S.errors = (S.errors or 0) + 1
             if S.errors <= 20 then log('tick error: %s', tostring(err)) end
@@ -4012,5 +4321,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.25-menu (中英 MODS 参数菜单；修满后恢复移速、跛行动画和腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.25-menu-perf3 (中英 MODS 参数菜单；修满后恢复移速、跛行动画和腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

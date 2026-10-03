@@ -247,11 +247,14 @@ do
     pcall(ffi.cdef, 'int __stdcall ReadProcessMemory(void *, const void *, void *, size_t, size_t *);')
     local ok, k = pcall(ffi.load, 'kernel32')
     local mbi, got = ffi.new('uint8_t[48]'), ffi.new('size_t[1]')
+    local old_i,new_i,new_f=ffi.new('int32_t[1]'),ffi.new('int32_t[1]'),ffi.new('float[1]')
+    local raw_buf,old_prot,back_prot=ffi.new('uint8_t[4]'),ffi.new('unsigned long[1]'),ffi.new('unsigned long[1]')
     W.writes, W.fails = 0, 0
     W.fast = ok  -- 离线测试里关掉
     -- 大块读取（v0.11）：先用 VirtualQuery 确认整段都是已提交、可读、非 guard 页（和 N.win.read 同样的规则），
     -- 再一次 ReadProcessMemory 读完。原来每 4 KB 一次 RPM + 字符串拼接
     local rbuf, rcap = nil, 0
+    function W.release_buffer() rbuf, rcap = nil, 0 end
     function W.read_big(p, n)
         if not (W.fast and ok) or type(p) ~= 'number' or p < 65536 or n < 1 or p + n > 140737488355328 then return nil end
         local at, finish = p, p + n
@@ -282,8 +285,7 @@ do
     end
     function W.i32(p, old, new)
         if not ok or new == old then return false end
-        local ob = ffi.new('int32_t[1]', old)
-        local nb = ffi.new('int32_t[1]', new)
+        local ob,nb=old_i,new_i;ob[0],nb[0]=old,new
         local before = N.win.read(p, 4)
         if before ~= ffi.string(ob, 4) or not W.writable(p) then W.fails = W.fails + 1; return false end
         stage('first memory write')
@@ -300,7 +302,7 @@ do
     -- float 字段（v0.12 影子字段）：旧值按原始 4 字节比对，所以不受浮点误差影响
     function W.f32(p, oldraw, new)
         if not ok then return false end
-        local nb = ffi.new('float[1]', new)
+        local nb=new_f;nb[0]=new
         local ns = ffi.string(nb, 4)
         if ns == oldraw then return false end
         if N.win.read(p, 4) ~= oldraw or not W.writable(p) then W.fails = W.fails + 1; return false end
@@ -322,7 +324,7 @@ do
     function W.raw(p, n, oldraw, newraw)
         if not ok or not (n == 1 or n == 4) then return false end
         if N.win.read(p, n) ~= oldraw then W.fails = W.fails + 1; return false end
-        local prot = ffi.new('unsigned long[1]')
+        local prot=old_prot
         local forced = false
         if not W.writable(p) then
             if not (C.native_force) then W.fails = W.fails + 1; return false end
@@ -330,13 +332,13 @@ do
             forced = true
             W.forced = (W.forced or 0) + 1
         end
-        local buf = ffi.new('uint8_t[?]', n)
+        local buf=raw_buf
         ffi.copy(buf, newraw, n)
         got[0] = 0
         local r = k.WriteProcessMemory(k.GetCurrentProcess(), ffi.cast('void *', p), buf, n, got)
         local good = r ~= 0 and tonumber(got[0]) == n and N.win.read(p, n) == newraw
         if forced then
-            local back = ffi.new('unsigned long[1]')
+            local back=back_prot
             ffi.C.VirtualProtect(ffi.cast('void *', p), n, prot[0], back)
         end
         if good then W.writes = W.writes + 1 else W.fails = W.fails + 1 end
@@ -367,8 +369,17 @@ local S = {
     shield_born = {}, shield_expired = {}, vstate = {},
     prev_counts = nil, seen_ent = nil, spotted = {},
     last_total = {}, last_hit = {}, frac = {}, ammo_max = {}, reported = {},
+    report_order = {}, report_slot = 0, index_cache = {}, config_cache = {},
 }
 REPAIR.vehicle_roster = function() return S.vehicles end
+local function report_once(key)
+    if S.reported[key] then return false end
+    S.report_slot = S.report_slot % 512 + 1
+    local old = S.report_order[S.report_slot]
+    if old then S.reported[old] = nil end
+    S.report_order[S.report_slot], S.reported[key] = key, true
+    return true
+end
 local function reset_context()
     S.vehicles, S.weapons, S.shields, S.seen_ent, S.spotted = {}, {}, {}, nil, {}
     S.last_total, S.last_hit, S.frac, S.ammo_max, S.reported, S.next_roster = {}, {}, {}, {}, {}, 0
@@ -376,6 +387,10 @@ local function reset_context()
     S.hptrace = nil
     S.wheel_trace, S.next_wheel_learn = nil, 0
     S.mech_trace = nil
+    S.watch, S.prev_counts = nil, nil
+    S.report_order, S.report_slot, S.index_cache, S.config_cache = {}, 0, {}, {}
+    N.lookup_cache, N.lookup_tables = nil, 0
+    W.release_buffer()
     FAULT.reset()
     TYRE.reset()
     S.next_fault=0
@@ -479,6 +494,12 @@ local function u32s(str) return ffi.cast('const uint32_t *', str) end
 -- 扫描 实体 -> 下标 哈希表，返回平行数组（不给每个条目建小表）
 local function scan_index(t, bound, what)
     local raw = bulk(t.entries, t.capacity * 8)
+    local cached = S.index_cache[t.p]
+    if cached and cached.signature == t.signature and cached.raw == raw and cached.bound == bound then
+        S.index_hits = (S.index_hits or 0) + 1
+        return cached.es, cached.js, cached.n, cached.maxj, raw
+    end
+    S.index_scans = (S.index_scans or 0) + 1
     local a, empty = u32s(raw), t.empty
     local es, js, n, maxj = {}, {}, 0, -1
     for i = 0, t.capacity * 2 - 2, 2 do
@@ -489,6 +510,9 @@ local function scan_index(t, bound, what)
             if j > maxj then maxj = j end
         end
     end
+    local count = 0; for _ in pairs(S.index_cache) do count = count + 1 end
+    if not cached and count >= 8 then S.index_cache = {} end
+    S.index_cache[t.p] = {signature=t.signature,raw=raw,bound=bound,es=es,js=js,n=n,maxj=maxj}
     return es, js, n, maxj, raw
 end
 
@@ -568,6 +592,22 @@ local function observe_ammo(manager, comp, weapons, first)
     end
 end
 
+local function prune_roster()
+    local live = {}
+    for _, entries in ipairs({S.vehicles, S.weapons}) do
+        for _, entry in ipairs(entries) do live[entry.d.entity .. ':' .. entry.d.goid] = true end
+    end
+    for _, entries in ipairs({S.last_total,S.last_hit,S.frac,S.ammo_max,S.wheel_trace or {},S.mech_trace or {}}) do
+        for key in pairs(entries) do
+            local owner = key:match('^(%d+:%d+)')
+            if owner and not live[owner] then entries[key] = nil end
+        end
+    end
+    REPAIR.prune(S.vehicles)
+    FAULT.prune(S.vehicles)
+    TYRE.prune(S.vehicles)
+end
+
 local function rebuild_roster()
     N.win.begin_sample()
     local hm = ptr(N.win.read(N.base + N.roots.health, 8) or ('\0'):rep(8), 0)
@@ -601,8 +641,7 @@ local function rebuild_roster()
                     local hp, life = i32(b, 0x14), u32(b, 0x19C)
                     if hp <= 0 or life ~= 0 then
                         local report = 'arm-health:' .. v.d.entity .. ':' .. v.d.goid .. ':' .. tostring(life)
-                        if not S.reported[report] then
-                            S.reported[report] = true
+                        if report_once(report) then
                             log('mech arm unavailable %s ent=%d goid=%d hp=%d life=%08x: %s', v.d.resource, v.d.entity, v.d.goid, hp, life,
                                 life ~= 0 and 'engine-dead; no respawn path' or 'zero HP; game repair requires a live native parent')
                         end
@@ -834,11 +873,22 @@ end
 local function config_address(g, net, hm, d)
     local j = g:lookup(g:table(hm + 0x1070), d.entity)
     if j ~= nil then return ptr(g:watch(hm + 0x10B0, 8), 0) + j * 0x5650 end
-    local t = ptr(g:watch(net + 0xF12B78, 8), 0); local start = N.mod64hex(d.resource, 1002)
+    local t = ptr(g:watch(net + 0xF12B78, 8), 0)
+    local cached = S.config_cache[d.resource]
+    if cached and cached.base == t then
+        local row = g:watch(cached.row, 16)
+        if hex64(row, 0) == d.resource then
+            local k = u32(row, 8); if k >= 1002 then error('Health settings index', 0) end
+            return t + 0x3EA0 + k * 0x5650
+        end
+    end
+    S.config_cache[d.resource] = nil
+    local start = N.mod64hex(d.resource, 1002)
     for step = 0, 63 do
         local row = g:watch(t + ((start + step) % 1002) * 16, 16); local key = hex64(row, 0)
         if key == d.resource then
             local k = u32(row, 8); if k >= 1002 then error('Health settings index', 0) end
+            S.config_cache[d.resource] = {base=t,row=t+((start+step)%1002)*16}
             return t + 0x3EA0 + k * 0x5650
         elseif key == '0000000000000000' then break end
     end
@@ -878,8 +928,9 @@ local CFG = {
 local CFG_ON = {}   -- [配置地址] = { orig/wrote = 4 字节原值/我们写的值, users = 本轮罩子里的载具数 }
 
 local function f32_at(s, o) return ffi.cast('const float *', s)[o / 4] end
-local function raw_f32(x) return ffi.string(ffi.new('float[1]', x), 4) end
-local function raw_u32(x) return ffi.string(ffi.new('uint32_t[1]', x), 4) end
+local scalar_f,scalar_u=ffi.new('float[1]'),ffi.new('uint32_t[1]')
+local function raw_f32(x) scalar_f[0]=x;return ffi.string(scalar_f,4) end
+local function raw_u32(x) scalar_u[0]=x;return ffi.string(scalar_u,4) end
 local function finite_pos(x) return type(x) == 'number' and x == x and x >= 0 and x < 1e7 end
 local function cfg_read(cfg, off)
     local b = N.win.read(cfg + off, 4)
@@ -988,8 +1039,7 @@ local function native_zone_open(e, zc)
         elseif not cur then
             blocked = blocked + 1
             local key = 'nz' .. e.res .. z.hash .. tostring(why)
-            if not S.reported[key] then
-                S.reported[key] = true
+            if report_once(key) then
                 log('native zone skip %s zone=%s: %s', e.res, z.hash, tostring(why))
             end
         end
@@ -1015,8 +1065,7 @@ local function native_apply(v, cfg, mx, rate, zc)
         local h, why = cfg_header(cfg)
         if not h then
             local k = 'nc' .. v.d.resource
-            if not S.reported[k] then
-                S.reported[k] = true
+            if report_once(k) then
                 log('native: %s %s 的配置头不像 HealthComponent（%s），这次不改配置；发 healcfg 看原始字节', v.kind, v.d.resource, tostring(why))
             end
             return false
@@ -1079,7 +1128,7 @@ native_close = function(cfg, why)
     end
 end
 local function native_close_all(why)
-    for _, v in pairs(S.vstate) do v.repair_credit = nil end
+    for _, v in pairs(S.vstate) do v.repair_credit, v.leg_check = nil, nil end
     local list = {}
     for cfg in pairs(CFG_ON) do list[#list + 1] = cfg end
     for _, cfg in ipairs(list) do native_close(cfg, why) end
@@ -1133,7 +1182,7 @@ local function trace_wheels(v, data, zc, cfg, native_zones)
     if C.tires and REPAIR.wheels then
         local ok, why = pcall(REPAIR.observe_damage, v.d, zc.zones, data)
         local report = 'wm' .. v.d.resource .. tostring(why)
-        if not ok and not S.reported[report] then S.reported[report] = true; log('wheel mapping skip %s: %s', v.d.resource, tostring(why)) end
+        if not ok and report_once(report) then log('wheel mapping skip %s: %s', v.d.resource, tostring(why)) end
     end
     S.wheel_trace = S.wheel_trace or {}
     local key = v.d.entity .. ':' .. v.d.goid .. ':' .. v.d.resource
@@ -1168,8 +1217,7 @@ local function repair_parts(v, zones, data, rate, dt, key, cfg)
     local d, changed = v.d, 0
     local function report(prefix, reason)
         local report_key = prefix .. key .. reason
-        if not S.reported[report_key] then
-            S.reported[report_key] = true
+        if report_once(report_key) then
             log('%s %s ent=%d: %s', prefix, v.kind, d.entity, reason)
         end
     end
@@ -1223,23 +1271,31 @@ local function repair_parts(v, zones, data, rate, dt, key, cfg)
             report('part repair skip', 'a part is disabled; game repair function affects all zones')
         else v.repair_credit = nil end
     else v.repair_credit = nil end
-    if C.exo_leg_fix and v.kind == 'exo' and not damaged and all_selected then
-        local ok, done, why = pcall(REPAIR.fix_leg, d, cfg, zones, W.f32, config_address)
+    local leg = v.leg_check
+    if damaged or not all_selected or not C.exo_leg_fix then v.leg_check=nil; leg=nil end
+    if C.exo_leg_fix and v.kind == 'exo' and not damaged and all_selected
+        and (not leg or leg.cfg~=cfg or S.clock>=leg.next_t) then
+        local proof=REPAIR.leg_proof(d,cfg,zones,config_address)
+        local ok, done, why = pcall(REPAIR.fix_leg, d, cfg, zones, W.f32, config_address, proof)
         if ok and done then changed = changed + 1
         elseif not ok or (why and why ~= 'no 0.75 leg penalty' and why ~= 'no stat modifier row'
             and why ~= 'exosuit is not fully repaired') then report('exo leg repair skip', tostring(ok and why or done)) end
-        local fire_ok, stopped, reason = pcall(REPAIR.stop_leg_fire, d, cfg, zones, config_address)
+        local fire_ok, stopped, reason = pcall(REPAIR.stop_leg_fire, d, cfg, zones, config_address, proof)
         if fire_ok and stopped then changed = changed + 1
         elseif not fire_ok or (reason and reason ~= 'no active leg fire' and reason ~= 'no effect reference row'
             and reason ~= 'no recognized leg fire pair' and reason ~= 'exosuit is not fully repaired') then
             report('exo leg fire skip', tostring(fire_ok and reason or stopped))
         end
-        local gait_ok, sent, gait_reason = pcall(REPAIR.fix_gait, d, cfg, zones, config_address, S.clock)
+        local gait_ok, sent, gait_reason = pcall(REPAIR.fix_gait, d, cfg, zones, config_address, S.clock, proof)
         if gait_ok and sent then changed = changed + 1
         elseif not gait_ok or (gait_reason and gait_reason ~= 'no limp animation state'
             and gait_reason ~= 'gait event pending' and gait_reason ~= 'exosuit is not fully repaired') then
             report('exo gait skip', tostring(gait_ok and gait_reason or sent))
         end
+        local calm=ok and (done or why=='no 0.75 leg penalty' or why=='no stat modifier row')
+            and fire_ok and not stopped and (reason=='no active leg fire' or reason=='no effect reference row' or reason=='no recognized leg fire pair')
+            and gait_ok and not sent and gait_reason=='no limp animation state'
+        v.leg_check={cfg=cfg,next_t=S.clock+(calm and 2 or C.tick)}
     end
     if C.tires and v.kind == 'frv' and S.clock >= (v.next_wheel or 0) then
         v.next_wheel = S.clock + math.max(0.5, C.wheel_interval)
@@ -1365,8 +1421,7 @@ local function heal(v, dt)
                 local n = amount(zk, z.max, rate, dt)
                 if n > 0 and W.i32(rec + zo, z.hp, math.min(z.max, z.hp + n)) then
                     changed = changed + 1
-                    if not S.reported['hz' .. key .. z.i] then
-                        S.reported['hz' .. key .. z.i] = true
+                    if report_once('hz' .. key .. z.i) then
                         log('hull zone %s entity=%d zone=%s from %d (state kept)', v.kind, d.entity, z.hash, z.hp)
                     end
                 end
@@ -1869,7 +1924,7 @@ local function tick(dt)
         -- 先读网络表：rebuild_roster 里的 owner 描述符直接从这份缓存取
         local ok2, list = pcall(net_descriptors, C.spot)
         local ok, err = pcall(rebuild_roster)
-        if not ok then log('roster: %s', tostring(err)) end
+        if ok then prune_roster() else log('roster: %s', tostring(err)) end
         NETDESC.raw = nil
         if ok2 then
             -- 护盾生成器实体在罩子消失后还会留在地上，所以按 wiki 持续时间（40 秒）计时：
@@ -1907,7 +1962,7 @@ local function tick(dt)
                 if not ok or (not done and why) then
                     local reason = tostring(ok and why or done)
                     local report = 'wl' .. v.d.resource .. reason
-                    if not S.reported[report] then S.reported[report] = true; log('wheel learn skip %s: %s', v.d.resource, reason) end
+                    if report_once(report) then log('wheel learn skip %s: %s', v.d.resource, reason) end
                 end
             end
         end
@@ -1936,16 +1991,16 @@ local function tick(dt)
             w.i = w.i + 1; if w.i > #w.marks then S.watch = nil end
         end
     end
-    if not C.enabled then native_close_all('mod off'); FAULT.close(); TYRE.close(); return end
+    if not C.enabled then native_close_all('mod off'); FAULT.close(S.clock); TYRE.close(S.clock); return end
     -- Prevention and failure latch also run outside the shield. Always sample
     -- before a repair pass, so healing cannot conceal a just-reached 1 HP state.
     if C.exo_weapon_guard or C.exo_shield_guard or C.frv_tire_guard then
         if S.clock >= (S.next_fault or 0) or S.acc+dt >= C.tick then
             S.next_fault=S.clock+0.05
-            if C.exo_weapon_guard or C.exo_shield_guard then FAULT.step(S.vehicles) else FAULT.close() end
-            if C.frv_tire_guard then TYRE.step(S.vehicles) else TYRE.close() end
+            if C.exo_weapon_guard or C.exo_shield_guard then FAULT.step(S.vehicles,S.clock) else FAULT.close(S.clock) end
+            if C.frv_tire_guard then TYRE.step(S.vehicles,S.clock) else TYRE.close(S.clock) end
         end
-    else FAULT.close(); TYRE.close() end
+    else FAULT.close(S.clock); TYRE.close(S.clock) end
     S.acc = S.acc + dt
     if S.acc < C.tick then return end
     local step = math.min(S.acc, 1); S.acc = 0
@@ -1976,16 +2031,16 @@ local function tick(dt)
                 local okh, rh = pcall(net_heal, v, step)
                 if not okh or type(rh) == 'string' then
                     local k = 'n' .. v.d.entity .. tostring(rh)
-                    if not S.reported[k] then S.reported[k] = true; log('net heal %s %d: %s', v.kind, v.d.entity, tostring(rh)) end
+                    if report_once(k) then log('net heal %s %d: %s', v.kind, v.d.entity, tostring(rh)) end
                 end
             end
             local ok, r = pcall(heal, v, step)
             if not ok then
                 v.repair_credit = nil
                 local k = v.d.entity .. tostring(r)
-                if not S.reported[k] then S.reported[k] = true; log('heal %s %d: %s', v.kind, v.d.entity, tostring(r)) end
+                if report_once(k) then log('heal %s %d: %s', v.kind, v.d.entity, tostring(r)) end
             end
-        else v.repair_credit = nil end
+        else v.repair_credit, v.leg_check = nil, nil end
     end
     native_idle('没有载具在罩子里')
     if C.ammo and N.weapon_ready then
@@ -1997,7 +2052,7 @@ local function tick(dt)
                 local ok, r = pcall(refill, w, step, false)
                 if not ok then
                     local k = 'w' .. w.d.entity .. tostring(r)
-                    if not S.reported[k] then S.reported[k] = true; log('ammo %s %d: %s', w.comp.name, w.d.entity, tostring(r)) end
+                    if report_once(k) then log('ammo %s %d: %s', w.comp.name, w.d.entity, tostring(r)) end
                 end
             end
         end
@@ -2024,6 +2079,7 @@ rawset(_G, 'update', function(dt, ...)
         menu_clock=menu_clock+dt
         MENU.step(menu_clock) -- Also available on the ship, with native guards closed, or while disabled.
         local ok, err = pcall(tick, dt)
+        REF.map, REF.frame, NETDESC.raw, S.want_units = nil, -1, nil, nil
         if not ok then
             S.errors = (S.errors or 0) + 1
             if S.errors <= 20 then log('tick error: %s', tostring(err)) end
@@ -2031,5 +2087,5 @@ rawset(_G, 'update', function(dt, ...)
     end
     if previous then return previous(dt, ...) end
 end)
-log('loaded v0.25-menu (中英 MODS 参数菜单；修满后恢复移速、跛行动画和腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
+log('loaded v0.25-menu-perf3 (中英 MODS 参数菜单；修满后恢复移速、跛行动画和腿部火焰；读取层来自 DRIVER HUD / HUD, MIT FireScallion)')
 return { installed = true }

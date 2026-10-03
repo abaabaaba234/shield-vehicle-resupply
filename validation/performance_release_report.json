@@ -1,0 +1,45 @@
+{
+  "build_version": "v0.25-menu-perf3",
+  "base_commit": "a523c6a",
+  "validation_date": "2026-10-04",
+  "tests_passed": [
+    "exo_gait_test",
+    "exo_leg_effect_test",
+    "exo_repair_test",
+    "guard_patrol_test",
+    "hotpath_test",
+    "mods_menu_test",
+    "native_guard_test",
+    "native_heal_test",
+    "part_regen_test",
+    "performance_cache_test",
+    "repair_native_test",
+    "shield_fault_test",
+    "svr_test",
+    "tyre_fault_test",
+    "weapon_fault_test"
+  ],
+  "in_game_feedback": {
+    "date": "2026-10-04",
+    "tested_by": "user",
+    "performance_acceptable": true,
+    "quantitative_perf3_report_provided": false
+  },
+  "simulated_reads_per_20_healthy_polls": {
+    "weapon_arm": {"perf2": 2960, "perf3": 869},
+    "frv": {"perf2": 2720, "perf3": 703}
+  },
+  "simulated_getters_per_20_single_wheel_failure_polls": {
+    "perf2": 80,
+    "perf3": 23
+  },
+  "outputs_sha256": {
+    "ShieldVehicleResupply_v0.25-menu-perf3.zip": "24483fd314d64534a7ed9eec27835f402a6fbe072ef948e0b827220ae089a12c",
+    "shield_vehicle_resupply.lua": "bd8e6034ca6079a8afad00a77b26baec3534de66edd277adc94c43739f5e7316"
+  },
+  "preserved_artifacts_sha256": {
+    "ShieldVehicleResupply_v0.25-menu.zip": "ca5e91f182567be89d8bf20de8e0c2f50273071bdfb97c33f4ce92ba80b7b473",
+    "ShieldVehicleResupply_v0.25-menu-perf.zip": "f94bf3f3eb8561741477c054b53343496cab48d50b8b54fb91db8b1c1caba698",
+    "ShieldVehicleResupply_v0.25-menu-perf2.zip": "ee1ad354daf5ee2cfe10baf81d54d432aa2abf68cace3bae73750fd784f21265"
+  }
+}

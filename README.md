@@ -33,7 +33,11 @@ v0.19 根据运行中机甲的只读采样修正挂接解析：Attachable 保存
 游戏版本需要和 DRIVER HUD 1.4.5 / HUD 1.11.1 一致（Steam build 25480438）。版本不对时，内置的代码特征校验会失败，mod 自动停用，**不会写任何内存**。
 
 ## 设置与命令
-本仓库当前构建版本为 `v0.25-menu`，支持 **ModOptionsMenu API 1 / version 2** 的 27 项参数控件。另装参数菜单模组后打开 **Esc → MODS → 护盾载具回血补弹**。第一行 Language 可选择简体汉字／English，应用后关闭并重新打开 Esc 菜单刷新文字。修改会保存到原设置文件；没有菜单也可继续使用文件与命令。安装、范围及验证见 [MODS 菜单说明](docs/MODS菜单.md)，源码与构建布局见 [仓库说明](docs/REPOSITORY.md)。Bingus Shared Loader 和 ModOptionsMenu 参数菜单各自独立。
+本仓库当前构建版本为 `v0.25-menu-perf3`，支持 **ModOptionsMenu API 1 / version 2** 的 27 项参数控件。另装参数菜单模组后打开 **Esc → MODS → 护盾载具回血补弹**。第一行 Language 可选择简体汉字／English，应用后关闭并重新打开 Esc 菜单刷新文字。修改会保存到原设置文件；没有菜单也可继续使用文件与命令。安装、范围及验证见 [MODS 菜单说明](docs/MODS菜单.md)，源码与构建布局见 [仓库说明](docs/REPOSITORY.md)。Bingus Shared Loader 和 ModOptionsMenu 参数菜单各自独立。
+
+性能优化版单独构建为 `v0.25-menu-perf3`，保留原版与前两轮性能优化安装包。该版缓存已验证的静态接口、配置槽位与未变化的实体索引，合并高频读取、降低已完成工作的轮询频率、复用临时缓冲区，并清理消失实体的状态。手臂与轮胎保护采用轻量健康巡检，仍约每 50 毫秒读取新鲜身份和血量，达到故障阈值立即完整处理。详细检查结果及离线验证见 [性能检查与优化](docs/性能检查与优化.md)。
+
+2026-10-04 用户完成 perf3 游戏内测试，反馈当前性能可接受。当前安装包见 [GitHub Release](https://github.com/abaabaaba234/shield-vehicle-resupply/releases/tag/v0.25-menu-perf3)，更新说明见 [perf3 发布记录](docs/releases/v0.25-menu-perf3.md)。
 
 文件都在 `%LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\`：
 - `shield_resupply_settings.txt`：设置，第一次运行时自动生成。改完后发 `reload`。
